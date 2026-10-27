@@ -100,6 +100,17 @@ def pdf_text(path):
     return text, pages, meta
 
 
+def norm_text(text):
+    """Мягкие переносы, тире и неразрывные пробелы -> обычные символы.
+
+    В PDF дефис часто восстанавливается как U+00AD, и проверка «123-45-67» без
+    нормализации проходит вхолостую — данные при этом остаются в файле.
+    """
+    return (text.replace("\xad", "-").replace("\u2010", "-").replace("\u2011", "-")
+            .replace("\u2012", "-").replace("\u2013", "-").replace("\u2014", "-")
+            .replace("\u00a0", " ").replace("\u2009", " ").replace("\u202f", " "))
+
+
 def pdf_streams(path):
     """Видимый текст: сырые байты файла и потоки содержимого страниц.
 
@@ -118,6 +129,7 @@ def pdf_streams(path):
 
 
 def whited_pixels(src, dst):
+    """Сколько пикселей стало чёрным (плашка теперь чёрная, как в кино)."""
     a = Image.open(src).convert("L")
     b = Image.open(dst).convert("L")
     if a.size != b.size:
@@ -127,7 +139,7 @@ def whited_pixels(src, dst):
     count = 0
     for y in range(0, h, 2):
         for x in range(0, w, 2):
-            if pa[x, y] < 128 <= pb[x, y]:
+            if pa[x, y] > 190 and pb[x, y] < 80:
                 count += 1
     return count
 
@@ -194,13 +206,14 @@ def main() -> int:
     check(os.path.exists(out_pdf), "создан doc_hidden.pdf")
     if os.path.exists(out_pdf):
         text, pages, meta = pdf_text(out_pdf)
-        left = [b for b in BANNED_DOC if b in text]
+        flat = norm_text(text)
+        left = [b for b in BANNED_DOC if b in flat]
         check(not left, "в тексте нет скрытых данных", f"осталось: {left}")
         check(pages == 1, "число страниц сохранено", str(pages))
-        check(len(text) > 100, "документ остаётся читаемым", f"{len(text)} символов")
+        check(len(text) > 80, "документ остаётся читаемым", f"{len(text)} символов")
         meta_core = {k: v for k, v in meta.items() if k != "format"}
         check(not meta_core, "метаданные очищены", str(meta_core))
-        streams = pdf_streams(out_pdf)
+        streams = norm_text(pdf_streams(out_pdf))
         left_s = [b for b in BANNED_DOC if b in streams]
         check(not left_s, "в потоках PDF нет скрытых данных", f"осталось: {left_s}")
 
@@ -255,7 +268,8 @@ def main() -> int:
         text, pages, _ = pdf_text(out_scan)
         check(pages == 1, "страница сохранена", str(pages))
         check(len(text.strip()) > 50, "текстовый слой добавлен", f"{len(text)} символов")
-        left = [b for b in BANNED_DOC if b in text]
+        flat = norm_text(text)
+        left = [b for b in BANNED_DOC if b in flat]
         check(not left, "в текстовом слое нет скрытых данных", f"осталось: {left}")
         shot = os.path.join(WORK, "scan_hidden.png")
         pymupdf.open(out_scan)[0].get_pixmap(dpi=200).save(shot)
@@ -271,6 +285,116 @@ def main() -> int:
         check(Image.open(out_img).size == Image.open(png).size, "размер сохранён")
         whited = whited_pixels(png, out_img)
         check(whited > 300, "пиксели данных выжжены", f"закрыто точек: {whited}")
+
+    print("\n== фамилия, разорванная OCR ==")
+    # сканер читает «ЯКОВЛЕВА-ЗАВАЛЬЕВСКАЯ» двумя кусками: раньше закрывался только хвост
+    pdf_lines(os.path.join(WORK, "torn.pdf"),
+              ["Выписка из распоряжения",
+               "признан(а)  ЯКОВЛЕВА-ЗАВАЛЬ ЕВСКАЯ С.А.",
+               "Начальник отдела  Е.А.Решетняк"])
+    r = run(["torn.pdf"])
+    out_torn = os.path.join(WORK, "torn_hidden.pdf")
+    check(r.returncode == 0 and os.path.exists(out_torn), "код возврата 0", r.stderr.strip()[:120])
+    if os.path.exists(out_torn):
+        text, _, _ = pdf_text(out_torn)
+        flat = norm_text(text)
+        left = [x for x in ("ЯКОВЛЕВА", "ЗАВАЛЬ", "ЕВСКАЯ", "Решетняк") if x in flat]
+        check(not left, "куски фамилии закрыты целиком", f"осталось: {left}")
+
+    print("\n== таблица: подпись сверху, значение снизу ==")
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_font(fontname="F0", fontfile=r"C:\Windows\Fonts\arial.ttf")
+    page.insert_text((60, 80), "Состав многодетной семьи", fontname="F0", fontsize=13)
+    page.insert_text((60, 120), "Дата рождения", fontname="F0", fontsize=10)
+    page.insert_text((60, 136), "20.09.1977", fontname="F0", fontsize=11)
+    page.insert_text((330, 120), "СНИЛС", fontname="F0", fontsize=10)
+    page.insert_text((330, 136), "123-456-789 00", fontname="F0", fontsize=11)
+    page.insert_text((60, 200), "Место рождения", fontname="F0", fontsize=10)
+    page.insert_text((60, 216), "дер. Верхнее Кукуево", fontname="F0", fontsize=11)
+    doc.save(os.path.join(WORK, "table.pdf"))
+    doc.close()
+    r = run(["table.pdf"])
+    out_tab = os.path.join(WORK, "table_hidden.pdf")
+    check(r.returncode == 0 and os.path.exists(out_tab), "код возврата 0", r.stderr.strip()[:120])
+    if os.path.exists(out_tab):
+        text, _, _ = pdf_text(out_tab)
+        flat = norm_text(text)
+        left = [x for x in ("20.09.1977", "123-456-789", "Кукуево") if x in flat]
+        check(not left, "значения под подписями закрыты", f"осталось: {left}")
+        check("Дата рождения" in flat and "Состав многодетной семьи" in flat,
+              "подписи и заголовок остались")
+
+    print("\n== свидетельство: значения закрыты, бланк читается, фото тоже ==")
+    photo = os.path.join(WORK, "photo.png")
+    Image.new("RGB", (300, 400), (198, 176, 150)).save(photo)
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_font(fontname="F0", fontfile=r"C:\Windows\Fonts\arial.ttf")
+    page.insert_text((150, 60), "СВИДЕТЕЛЬСТВО О РОЖДЕНИИ", fontname="F0", fontsize=14)
+    page.insert_image(pymupdf.Rect(60, 90, 200, 270), filename=photo)
+    page.insert_text((250, 110), "Кузнецова", fontname="F0", fontsize=11)
+    page.insert_text((60, 320), "Дата рождения  03.04.1991", fontname="F0", fontsize=11)
+    page.insert_text((60, 340), "Кем выдан  ОВД Тверского района", fontname="F0", fontsize=11)
+    doc.save(os.path.join(WORK, "svidetelstvo.pdf"))
+    doc.close()
+    r = run(["svidetelstvo.pdf"])
+    out_sv = os.path.join(WORK, "svidetelstvo_hidden.pdf")
+    check(r.returncode == 0 and os.path.exists(out_sv), "код возврата 0", r.stderr.strip()[:120])
+    if os.path.exists(out_sv):
+        text, pages, _ = pdf_text(out_sv)
+        flat = norm_text(text)
+        left = [x for x in ("Кузнецова", "03.04.1991", "Тверского", "ОВД") if x in flat]
+        check(not left, "поля бланка закрыты", f"осталось: {left}")
+        check("СВИДЕТЕЛЬСТВО О РОЖДЕНИИ" in flat, "заголовок бланка на месте")
+        check(pages == 1, "страница сохранена", str(pages))
+        doc2 = pymupdf.open(out_sv)
+        pix = doc2[0].get_pixmap(dpi=72, colorspace=pymupdf.csGRAY, alpha=False)
+        im = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+        doc2.close()
+        low = im.crop((80, 110, 180, 250)).getextrema()
+        check(low[1] < 45, "фотография закрыта", f"самый светлый пиксель {low[1]}")
+        readable = [x for x in ("СВИДЕТЕЛЬСТВО О РОЖДЕНИИ", "Дата рождения", "Кем выдан")
+                    if x in flat]
+        check(len(readable) >= 2, "бланк остаётся узнаваемым", f"видно: {readable}")
+
+    print("\n== скан паспорта: фотография и поля ==")
+    scan_src = os.path.join(WORK, "svidetelstvo.pdf")
+    png = os.path.join(WORK, "passport_page.png")
+    pymupdf.open(scan_src)[0].get_pixmap(dpi=200).save(png)
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_image(page.rect, filename=png)
+    doc.save(os.path.join(WORK, "passport_scan.pdf"))
+    doc.close()
+    r = run(["passport_scan.pdf"])
+    out_scan2 = os.path.join(WORK, "passport_scan_hidden.pdf")
+    check(r.returncode == 0 and os.path.exists(out_scan2), "код возврата 0", r.stderr.strip()[:120])
+    if os.path.exists(out_scan2):
+        text, pages, _ = pdf_text(out_scan2)
+        flat = norm_text(text)
+        left = [x for x in ("Кузнецова", "03.04.1991", "Тверского") if x in flat]
+        check(not left, "поля на скане закрыты", f"осталось: {left}")
+        doc2 = pymupdf.open(out_scan2)
+        pix = doc2[0].get_pixmap(dpi=72, colorspace=pymupdf.csGRAY, alpha=False)
+        im = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+        doc2.close()
+        low = im.crop((85, 115, 175, 245)).getextrema()
+        check(low[1] < 60, "фотография на скане закрыта", f"самый светлый пиксель {low[1]}")
+
+    print("\n== редкое имя без суффикса и без инициалов ==")
+    pdf_lines(os.path.join(WORK, "rare.pdf"),
+              ["Заявление",
+               "Прошу зачислить Сафронов Айгуль на обучение.",
+               "Директор школы  Ярцев К.К."])
+    r = run(["rare.pdf"])
+    out_rare = os.path.join(WORK, "rare_hidden.pdf")
+    check(r.returncode == 0 and os.path.exists(out_rare), "код возврата 0", r.stderr.strip()[:120])
+    if os.path.exists(out_rare):
+        text, _, _ = pdf_text(out_rare)
+        flat = norm_text(text)
+        left = [x for x in ("Сафронов", "Айгуль", "Ярцев") if x in flat]
+        check(not left, "имя рядом с фамилией закрыто", f"осталось: {left}")
 
     print("\n== выбор категорий ==")
     r = run(["doc.md", "--keep", "person", "-o", "keep.md"])
@@ -294,6 +418,13 @@ def main() -> int:
     r = run(["doc.md"], keep_name=False)
     plain = [f for f in os.listdir(WORK) if f.endswith("_hidden.md")]
     check(r.returncode == 0 and bool(plain), "чистое имя -> _hidden", str(plain[:2]))
+
+    print("\n== имена результатов ==")
+    produced = [f for f in os.listdir(WORK) if os.path.isfile(os.path.join(WORK, f)) and "_hidden" in f]
+    anon_named = [f for f in os.listdir(WORK) if "_anon" in f]
+    check(not anon_named, "ни одного файла с _anon", str(anon_named[:5]))
+    check(len(produced) >= 6 and all("_hidden" in f for f in produced),
+          "у всех результатов суффикс _hidden", f"{len(produced)} файлов")
 
     print("\n== отчёт и ошибки ==")
     r = run(["doc.md", "-o", "rep.md", "--report", "report.json"])

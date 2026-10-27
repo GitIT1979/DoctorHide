@@ -119,14 +119,31 @@ def safe_name(ext: str) -> str:
     return f"document_{n:02d}{ext}"
 
 
-def _reset_dirs() -> None:
+def _reset_dirs(wipe: bool = True) -> None:
+    """Готовит рабочие папки.
+
+    При старте ничего не удаляем: иначе запуск второго экземпляра стирает
+    результаты уже обработанной пачки.
+    """
     for d in (IN_DIR, OUT_DIR):
-        shutil.rmtree(d, ignore_errors=True)
+        if wipe:
+            shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d, exist_ok=True)
 
 
-def _convert(src: str, dst_dir: str, name: str) -> str:
-    """Конвертирует один файл, возвращает путь результата."""
+def _unique(dst: str) -> str:
+    """Одинаковые имена не должны затирать друг друга в папке результатов."""
+    if not os.path.exists(dst):
+        return dst
+    stem, ext = os.path.splitext(dst)
+    n = 2
+    while os.path.exists(f"{stem}_{n}{ext}"):
+        n += 1
+    return f"{stem}_{n}{ext}"
+
+
+def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
+    """Конвертирует один файл: (путь результата, сводка по утечкам)."""
     ext = os.path.splitext(name)[1].lower()
     base = os.path.splitext(name)[0]
     enabled = set(D.CATEGORIES)
@@ -138,30 +155,94 @@ def _convert(src: str, dst_dir: str, name: str) -> str:
         text = "".join(p.get_text() for p in doc)
         doc.close()
         mode = "judicial" if D.is_court_act(text) else "document"
-        dst = os.path.join(dst_dir, D.output_name(name, ".pdf", enabled, mode))
-        D.render_pdf(src, dst, mode, enabled, "auto", 300, False, False)
-        return dst
+        dst = _unique(os.path.join(dst_dir, D.output_name(name, ".pdf", enabled, mode)))
+        rep = D.render_pdf(src, dst, mode, enabled, "auto", 300, False, False)
+        # повторная проверка результата: что программа всё-таки нашла в готовом файле
+        left = D.verify_pdf(dst, enabled, mode)
+        return dst, {"mode": mode, "boxes": rep.get("boxes", 0),
+                     "photos": (rep.get("categories") or {}).get("qr", 0), "leftover": left}
 
     if ext in IMAGE_EXT:
-        dst = os.path.join(dst_dir, D.output_name(name, ext, enabled, "document"))
-        D.render_image(src, dst, "document", enabled, False)
-        return dst
+        dst = _unique(os.path.join(dst_dir, D.output_name(name, ext, enabled, "document")))
+        rep = D.render_image(src, dst, "document", enabled, False)
+        return dst, {"mode": "document", "boxes": rep.get("boxes", 0),
+                     "photos": 0, "leftover": {}}
 
     if ext in (".docx", ".doc"):
         md = D.docx_to_md(src)
-        anon, _ = D.anonymize_text(md, "document", enabled, False)
-        dst = os.path.join(dst_dir, D.output_name(name, ".md", enabled, "document"))
+        anon, stats = D.anonymize_text(md, "document", enabled, False)
+        dst = _unique(os.path.join(dst_dir, D.output_name(name, ".md", enabled, "document")))
         with open(dst, "w", encoding="utf-8") as f:
             f.write(anon)
-        return dst
+        return dst, {"mode": "document", "boxes": 0, "photos": 0, "leftover": {}}
 
-    with open(src, encoding="utf-8", errors="replace") as f:
-        raw = f.read()
-    anon, _ = D.anonymize_text(raw, "document", enabled, False)
-    dst = os.path.join(dst_dir, D.output_name(name, ext, enabled, "document"))
-    with open(dst, "w", encoding="utf-8") as f:
-        f.write(anon)
-    return dst
+    if ext in (".md", ".markdown", ".txt"):
+        with open(src, encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+        anon, stats = D.anonymize_text(raw, "document", enabled, False)
+        dst = _unique(os.path.join(dst_dir, D.output_name(name, ext, enabled, "document")))
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(anon)
+        return dst, {"mode": "document", "boxes": 0, "photos": 0, "leftover": {}}
+
+    # «всё остальное» раньше молча читалось как текст и пропускалось мимо обработки
+    raise ValueError(f"формат {ext or 'без расширения'} не поддерживается")
+
+
+def _restore_queue() -> None:
+    """Возвращает в очередь файлы, загруженные в прошлый раз.
+
+    Иначе после перезапуска приложения залитая пачка терялась и её приходилось
+    загружать заново.
+    """
+    try:
+        names = sorted(os.listdir(IN_DIR))
+    except OSError:
+        return
+    for fn in names:
+        if "_" not in fn:
+            continue
+        fid, name = fn.split("_", 1)
+        if len(fid) != 12 or not name:
+            continue
+        with LOCK:
+            if any(f["id"] == fid for f in FILES):
+                continue
+            if len(FILES) >= MAX_FILES:
+                return
+            path = os.path.join(IN_DIR, fn)
+            FILES.append({"id": fid, "name": name, "orig": name, "path": path,
+                          "size": os.path.getsize(path), "ext": os.path.splitext(name)[1].lower(),
+                          "status": "queued", "out": None, "error": None, "duration": None})
+    if FILES:
+        log(f"восстановлено в очереди: {len(FILES)} файлов")
+
+
+def _manifest() -> str:
+    """Текст отчёта для архива: ни один файл не пропадает из выдачи молча."""
+    lines = ["DoctorHide — отчёт по партии", ""]
+    lines.append(f"файлов в очереди: {len(FILES)}")
+    done = [f for f in FILES if f["status"] == "done"]
+    errors = [f for f in FILES if f["status"] != "done"]
+    lines.append(f"обработано: {len(done)}")
+    lines.append(f"не обработано: {len(errors)}")
+    lines.append("")
+    for f in FILES:
+        if f["status"] == "done":
+            info = f.get("info") or {}
+            cats = ", ".join(f"{k}:{v}" for k, v in sorted((info.get("leftover") or {}).items()))
+            lines.append(f"[готово] {f['name']} -> {f['out']}")
+            lines.append(f"         режим: {info.get('mode', '—')}, плашек: {info.get('boxes', 0)},"
+                         f" фото закрыто: {info.get('photos', 0)}")
+            if cats:
+                lines.append(f"         ВНИМАНИЕ, найдено в результате: {cats}")
+        else:
+            lines.append(f"[НЕ ОБРАБОТАН] {f['name']}: {f.get('error') or f['status']}")
+    if errors:
+        lines.append("")
+        lines.append("Файлы с пометкой «НЕ ОБРАБОТАН» в архив не вошли — их надо перезалить"
+                     " или сохранить в поддержанном формате (PDF, DOCX, MD, TXT, PNG/JPEG/TIFF/BMP/WEBP).")
+    return "\n".join(lines) + "\n"
 
 
 def _worker() -> None:
@@ -177,12 +258,15 @@ def _worker() -> None:
             item["status"] = "running"
             item["t0"] = time.time()
         try:
-            out = _convert(item["path"], OUT_DIR, item["name"])
+            out, info = _convert(item["path"], OUT_DIR, item["name"])
             with LOCK:
                 item["status"] = "done"
                 item["out"] = os.path.basename(out)
+                item["info"] = info
                 item["duration"] = round(time.time() - item["t0"], 2)
-            log(f"OK   {item['name']} -> {os.path.basename(out)}")
+            left = info.get("leftover") or {}
+            warn = " ! остатки: " + ", ".join(f"{k}:{v}" for k, v in left.items()) if left else ""
+            log(f"OK   {item['name']} -> {os.path.basename(out)}{warn}")
         except Exception as err:  # noqa: BLE001
             with LOCK:
                 item["status"] = "error"
@@ -269,7 +353,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/zip":
             with LOCK:
                 ready = [(f["id"], f["out"]) for f in FILES if f["status"] == "done"]
-            key = tuple(ready)
+                report = _manifest()
+            key = (tuple(ready), report)
             target = ZIP_CACHE["path"]
             if ZIP_CACHE["key"] != key or not os.path.exists(target):
                 tmp = target + ".tmp"
@@ -278,6 +363,7 @@ class Handler(BaseHTTPRequestHandler):
                         source = os.path.join(OUT_DIR, out)
                         if os.path.exists(source):
                             zf.write(source, arcname=out)
+                    zf.writestr("_ОТЧЁТ.txt", report)
                 os.replace(tmp, target)
                 ZIP_CACHE["key"] = key
             data = open(target, "rb").read()
@@ -409,8 +495,14 @@ def main() -> int:
     ap.add_argument("--host", default="127.0.0.1")
     args = ap.parse_args()
 
-    _reset_dirs()
-    httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    _reset_dirs(wipe=False)
+    _restore_queue()
+    try:
+        httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError:
+        print(f"Приложение уже запущено: http://{args.host}:{args.port}/ — "
+              "второй экземпляр не нужен", flush=True)
+        return 0
     print(f"DoctorHide GUI: http://{args.host}:{args.port}/", flush=True)
     try:
         httpd.serve_forever()
