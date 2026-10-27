@@ -22,11 +22,13 @@ DoctorHide — обезличивание документов (PDF, DOCX, MD/TX
   docno      номера документов
 
 Вывод:
-  PDF        белые плашки, исходный текст под ними удалён (apply_redactions);
-             остальное содержимое остаётся текстом — файл читается и ищется.
+  PDF        чёрные плашки (белые — по флагу --white-bars), исходный текст под ними
+             удалён (apply_redactions); остальное содержимое остаётся текстом —
+             файл читается и ищется.
              Скан-страница без текстового слоя пересобирается из того же растра
              с выжженными областями (вёрстка 1:1).
-  Изображения PNG/JPEG/TIFF — белые плашки выжигаются в пикселях, формат сохраняется.
+  Изображения PNG/JPEG/TIFF — плашки выжигаются в пикселях, формат сохраняется.
+  QR-коды и штрихкоды в растре закрываются тем же сканером, что и для сканов PDF.
   DOCX       конвертируется в Markdown, значения заменяются на [censored].
   MD/TXT     значения заменяются на [censored].
 
@@ -63,9 +65,7 @@ import pymupdf
 from PIL import Image, ImageDraw
 
 PLACEHOLDER = "[censored]"
-SAFE_NAME = False
 KEEP_NAME = False
-NAME_COUNTER = {"n": 0}
 CURRENT = {"enabled": None, "mode": "document"}
 BAR_BORDER = False
 # Плашка — чёрная, как в шпионских фильмах. Белая заливка — по флагу --white-bars.
@@ -259,16 +259,18 @@ RULES: List[Tuple[str, str, str, Optional[str], int]] = [
     ("realty", "area", r"\b\d+[.,]?\d*\s*(?:кв\.?\s*м|м2|кв\.?м|гектар\w*|га\b)", None, 0),
     # --- contacts ---
     ("contacts", "phone", r"(?:\+7|8)[\s\-(]*\d{3}[\s\-)]*\d{3}[\s\-]?\d{2}[\s\-]?\d{2}\b", None, 0),
+    ("contacts", "phone_local", r"(?<!\d)(?:\(\d{3}\)|\d{3})[\s\-]\d{3}[\s\-]\d{2}[\s\-]\d{2}(?!\d)", None, 0),
     ("contacts", "email", r"\b[\w.+-]+@[\w-]+\.[\w.-]{2,}\b", None, 0),
     ("contacts", "messenger",
      r"(?:telegram|whatsapp|whats\s?app|viber|телеграм|ватсап|вибер)[\s:]*@?[A-Za-z0-9_]{3,}", None, 0),
     # --- bank ---
     ("bank", "bank_acc", r"\b\d{20}\b", None, 0),
+    ("bank", "bank_acc_spaced", r"(?<!\d)(?:\d{4}[ ]){4}\d{4}(?!\d)", None, 0),
     ("bank", "bik", r"(?:БИК\s*[:№]?\s*)?\b(04\d{7})\b", None, 1),
     ("bank", "card", r"\b(?:\d{4}[ -]?){3}\d{4}\b", None, 0),
     ("bank", "bank_name", r"\b[А-ЯЁ][А-Яа-яЁё\-]*(?:банк|Банк)\b", None, 0),
     ("bank", "account_terms",
-     r"\b(?:расчётн\w+|расчетн\w+|р/с|к/с|корр\.?\s*сч\w*|лицев\w+\s+сч\w*|счёт|счет)\s*[:№]?\s*[\d\s]{5,25}", None, 0),
+     r"\b(?:расчётн\w+|расчетн\w+|р/с|к/с|корр\.?\s*сч\w*|корреспондентск\w+|лицев\w+\s+сч\w*|счёт|счет)\s*[:№]?\s*[\d\s]{5,25}", None, 0),
     # --- finance ---
     ("finance", "money",
      r"\b\d[\d\s\u00a0]{2,}(?:[.,]\d{1,2})?\s*(?:руб\w*|₽|тыс\.?\s*руб\w*|млн\w*|млрд\w*|долл\w*|USD|EUR|евро)\b", None, 0),
@@ -295,6 +297,10 @@ RULES: List[Tuple[str, str, str, Optional[str], int]] = [
     ("birth", "age_years", r"\b\d{1,3}\s*(?:лет|года|год)\b", None, 0),
     ("birth", "dob", r"(?:дата\s+рождения|родил\w*|г\.\s*р\.)\s*[:—-]?\s*\d{1,2}[./]\d{1,2}[./]\d{2,4}", None, 0),
     ("birth", "dob_plain", r"\b\d{1,2}[./]\d{1,2}[./](?:19|20)\d{2}\s*(?:г\.?\s*)?(?:р\.|года рождения)", None, 0),
+    # сокрытию подлежат все даты, а не только рождения и выдачи документов
+    ("birth", "date_num", r"\b\d{1,2}[.\-/]\d{1,2}[.\-/]\d{2,4}\b", None, 0),
+    ("birth", "date_words_short", r"\b\d{1,2}\s+(?:января|февраля|марта|апреля|мая|июня|июля|августа|сентября|октября|ноября|декабря)\s+(?:19|20)\d{2}\b", None, 0),
+    ("birth", "year_word", r"\b(?:19|20)\d{2}\s*(?:г\.|год|года|году)\b", None, 0),
     # --- kinship ---
     ("kinship", "kinship",
      r"\b(?:сын|дочь|дочер[ьи]|мать|матер[ьи]|отец|отца|жена|жены|супруг\w*|брат|брата|сестра|"
@@ -334,9 +340,10 @@ RULES: List[Tuple[str, str, str, Optional[str], int]] = [
 ]
 
 BLOCK_RULES = {
-    "passport", "passport_code", "drv_series", "snils", "phone", "bank_acc", "bik", "inn",
-    "kpp", "ogrn", "long_number", "gov_body", "legal_entity", "addr_street", "addr_house",
-    "city_label", "region", "city", "cadastral", "realty_obj", "account_terms", "card",
+    "passport", "passport_code", "drv_series", "snils", "phone", "phone_local", "bank_acc",
+    "bank_acc_spaced", "bik", "inn", "kpp", "ogrn", "long_number", "gov_body",
+    "legal_entity", "addr_street", "street_before", "addr_house", "city_label", "region",
+    "city", "cadastral", "realty_obj", "account_terms", "card", "email", "messenger",
 }
 
 ID_RULES = {"inn", "kpp", "ogrn", "snils", "passport", "passport_code", "drv_series",
@@ -561,6 +568,18 @@ def _tokens(line: Line):
     return _tokens_of(normalize(line.text))
 
 
+def _given_like(low: str) -> bool:
+    """Имя из справочника или двойное имя: любая часть через дефис — имя
+    («софья-анна», «джан-пьер»). Фамилии двойные ловятся отдельно."""
+    if low in GIVEN_NAMES:
+        return True
+    if "-" in low:
+        parts = [p for p in low.split("-") if p]
+        return (len(parts) >= 2 and any(p in GIVEN_NAMES for p in parts)
+                and all(re.fullmatch(r"[а-яё]+", p) for p in parts))
+    return False
+
+
 def _name_like(tok: str) -> bool:
     """Слово похоже на часть ФИО: имя из справочника, фамилия, отчество, инициалы."""
     t = _cyr(tok).strip(".,;:()«»\"'")
@@ -573,7 +592,7 @@ def _name_like(tok: str) -> bool:
     low = t.lower()
     if low in NAME_STOP:
         return False
-    return low in GIVEN_NAMES or bool(SURNAME.search(low)) or bool(PATRONYMIC.search(low))
+    return _given_like(low) or bool(SURNAME.search(low)) or bool(PATRONYMIC.search(low))
 
 
 def _hyphen_part(tok: str) -> bool:
@@ -655,12 +674,12 @@ def find_names(line: Line) -> List[Tuple[int, int]]:
                 end = toks[i + 2][1]
             spans.append((a, end))
             continue
-        if low in GIVEN_NAMES and i + 1 < n and as_name(toks[i + 1][2]):
+        if _given_like(low) and i + 1 < n and as_name(toks[i + 1][2]):
             spans.append((a, toks[i + 1][1]))
             continue
         if i > 0 and toks[i - 1][2].lower() in NAME_MARKERS:
             nxt = low
-            if not (nxt in GIVEN_NAMES or (name_tok(t) and SURNAME_STRICT.search(nxt))):
+            if not (_given_like(nxt) or (name_tok(t) and SURNAME_STRICT.search(nxt))):
                 continue
             end = b
             for k in (i + 1, i + 2):
@@ -692,6 +711,79 @@ def english_names(line: Line) -> List[Tuple[int, int]]:
     for m in re.finditer(r"\b(?:Mr|Mrs|Ms|Dr|Prof)\.?\s+[A-Z][a-z]+(?:\s+[A-Z][a-z]+)?\b", line.text):
         out.append((m.start(), m.end()))
     return out
+
+
+def _norm_tok(tok: str) -> str:
+    return _cyr(tok).strip(".,;:()«»\"'").lower()
+
+
+def cross_line_name_spans(lines: List[Line]) -> List[Tuple[int, int, int]]:
+    """ФИО, разорванное по строкам: «Иванов» / «Иван Иванович» — с разрывом или без.
+
+    Возвращает (индекс строки, начало, конец) в её нормализованном тексте.
+    Срабатывает на стыке соседних непустых строк, если хвост первой похож на
+    фамилию (или имя), а начало второй — на имя, фамилию или отчество. Строки
+    должны быть визуально близки: зазор не больше пары высот строки — пустая
+    строка между частями ФИО допустима, соседний абзац — нет.
+    """
+    spans: List[Tuple[int, int, int]] = []
+    idx = [i for i, ln in enumerate(lines) if ln.text.strip()]
+    for k in range(len(idx) - 1):
+        i, j = idx[k], idx[k + 1]
+        l1, l2 = lines[i], lines[j]
+        t1, t2 = _tokens(l1), _tokens(l2)
+        if not t1 or not t2 or len(l2.words) > 4:
+            continue
+        if l1.words and l2.words:
+            h = max(l1.words[-1].rect.height, l2.words[0].rect.height, 1.0)
+            dy = l2.words[0].rect.y0 - l1.words[-1].rect.y1
+            if dy > max(30.0, 2.4 * h):
+                continue
+        a, b = _norm_tok(t1[-1][2]), _norm_tok(t2[0][2])
+        if len(a) < 2 or len(b) < 2 or a in NAME_STOP or b in NAME_STOP:
+            continue
+        a_surname = bool(SURNAME_STRICT.search(a))
+        b_surname = bool(SURNAME_STRICT.search(b))
+        pair = ((a_surname and (_given_like(b) or bool(PATRONYMIC.search(b))))
+                or (_given_like(a) and (b_surname or bool(PATRONYMIC.search(b)))))
+        if not pair:
+            continue
+        spans.append((i, t1[-1][0], t1[-1][1]))
+        rest_name_like = len(t2) <= 3 and all(
+            _given_like(_norm_tok(t[2])) or bool(SURNAME.search(_norm_tok(t[2])))
+            or bool(PATRONYMIC.search(_norm_tok(t[2]))) for t in t2)
+        spans.append((j, t2[0][0], t2[-1][1] if rest_name_like else t2[0][1]))
+    return spans
+
+
+def cross_line_contact_spans(lines: List[Line]) -> List[Tuple[int, int, int]]:
+    """E-mail и телефон, разорванные переносом строки: «ivanov@» / «example.ru».
+
+    Возвращает (индекс строки, начало, конец) в её нормализованном тексте.
+    """
+    spans: List[Tuple[int, int, int]] = []
+    idx = [i for i, ln in enumerate(lines) if ln.text.strip()]
+    for k in range(len(idx) - 1):
+        i, j = idx[k], idx[k + 1]
+        t1, t2 = normalize(lines[i].text), normalize(lines[j].text)
+        m1 = re.search(r"[\w.+-]+@$", t1)
+        m2 = re.match(r"([A-Za-zА-Яа-яЁё0-9-]+(?:\.[A-Za-zА-Яа-яЁё0-9-]+)+)", t2)
+        if m1 and m2:
+            spans.append((i, m1.start(), m1.end()))
+            spans.append((j, m2.start(1), m2.end(1)))
+            continue
+        p1 = re.search(r"(\+7|8)[\s\-]?\(?\d{3}[\s\-)]?$", t1)
+        m3 = re.match(r"\d{3}[\s\-]?\d{2}[\s\-]?\d{2}\b", t2)
+        if p1 and m3:
+            spans.append((i, p1.start(), len(t1)))
+            spans.append((j, 0, m3.end()))
+            continue
+        p2 = re.search(r"\d{3}[\s\-]\d{2}$", t1)
+        if p2 and re.match(r"\d{2}(?!\d)", t2):
+            m4 = re.match(r"\d{2}", t2)
+            spans.append((i, p2.start(), p2.end()))
+            spans.append((j, 0, m4.end()))
+    return spans
 
 
 # --------------------------------------------------------------------------- #
@@ -867,13 +959,6 @@ LABEL_WORDS = {
     "приобретения", "расторжения", "брака", "родства", "опекуна", "родителей", "отец", "мать",
     "выдавший", "когда", "где", "каким", "органом", "код", "предъявителя",
 }
-# маркеры того, что на странице бланк личности (OCR читает их даже на плохих фото)
-IDENT_LOOSE_RX = re.compile(
-    r"паспорт|свидетельств|полис|омс|снилс|страхово\w*\s+свидетельств|удостоверени\w*|"
-    r"российская\s+федерация|загс|заключени\w+\s+брака|о\s+рождении|о\s+рождении\.|"
-    r"обязательн\w+|страховани\w*", re.I)
-
-
 # машинная зона паспорта: строки латиницей с «<<» — фамилия, номер, даты
 MRZ_RX = re.compile(r"[A-Z0-9<]{15,}")
 
@@ -881,99 +966,6 @@ MRZ_RX = re.compile(r"[A-Z0-9<]{15,}")
 def _is_mrz(text: str) -> bool:
     compact = text.replace(" ", "")
     return any(m.group().count("<") >= 3 for m in MRZ_RX.finditer(compact))
-
-
-def page_is_identity(lines: List[Line], page_rect: pymupdf.Rect) -> bool:
-    """Бланк личности на странице — даже если OCR читает его плохо."""
-    body = [ln for ln in lines if ln.words]
-    if len(body) < 45 and page_has_identity_fields(lines):
-        return True
-    for line in body:
-        text = normalize(line.text).strip()
-        # машинная зона: PNRUS...<< — всегда паспорт или другой документ с MRZ
-        if _is_mrz(text):
-            return True
-        # «РОССИЙСКАЯ  Ф Е Д Е Р А Ц И Я» с разрядкой: пробелы внутри слова
-        if "РОССИЙСКАЯФЕДЕРАЦИЯ" in text.upper().replace(" ", ""):
-            return True
-    # заголовок ищем только в самом верху: «СНИЛС» посреди договора — не бланк
-    for line in body[:3]:
-        text = normalize(line.text).strip()
-        m = IDENT_LOOSE_RX.search(text)
-        if not m:
-            continue
-        if len(text.split()) <= 6 and (m.end() - m.start()) >= max(6, len(text) * 0.4):
-            return True
-    return False
-
-
-def _is_label_line(line: Line) -> bool:
-    """Строка — только подпись поля («фамилия», «дата рождения»), без значения."""
-    text = normalize(line.text)
-    if re.search(r"\d", text) or ":" in text:
-        return False
-    toks = re.findall(r"[А-Яа-яЁё\-]+", text.lower())
-    if not toks or len(toks) > 5:
-        return False
-    return all(t in LABEL_WORDS for t in toks)
-
-
-TITLE_WORDS = {
-    "свидетельство", "паспорт", "полис", "снилс", "удостоверение", "о", "об", "и",
-    "рождении", "браке", "заключении", "расторжении", "удочерении", "усыновлении", "смерти",
-    "российская", "федерация", "страховое", "обязательного", "медицинского", "страхования",
-    "многодетной", "семьи", "гражданина", "документ",
-}
-
-
-def _is_title_line(line: Line, page_rect: pymupdf.Rect) -> bool:
-    """Строка — название документа (его оставляем открытым)."""
-    text = normalize(line.text).strip()
-    if len(text) > 80:
-        return False
-    m = IDENT_DOC_RX.search(text)
-    if m and (m.end() - m.start()) >= max(10, len(text) * 0.45):
-        return True
-    if page_rect is not None and min(w.rect.y0 for w in line.words) > page_rect.height * 0.3:
-        return False
-    toks = re.findall(r"[А-Яа-яЁё\-]+", text.lower())
-    return bool(toks) and all(t in TITLE_WORDS for t in toks)
-
-
-def identity_cover_bands(lines: List[Line], page_rect: pymupdf.Rect) -> List[pymupdf.Rect]:
-    """Бланк личности: закрываем всё поле, оставляя только заголовок и подписи полей.
-
-    Опираться на распознанный текст тут нельзя: на фото бланка OCR читает фамилию
-    как «Sanwa», а подписи соседних полей смешивает со значениями. Поэтому закрывается
-    вся область бланка, а открытыми остаются название документа и чистые подписи.
-    """
-    ordered = sorted([ln for ln in lines if ln.words], key=lambda ln: ln.words[0].rect.y0)
-    # машинная зона (MRZ) — это сам паспорт: тут оставлять нечего
-    for line in ordered:
-        if _is_mrz(normalize(line.text)):
-            return [pymupdf.Rect(0, 0, page_rect.width, page_rect.height)]
-    kept = []
-    for line in ordered:
-        if _is_title_line(line, page_rect) or _is_label_line(line):
-            kept.append((min(w.rect.y0 for w in line.words) - 1,
-                         max(w.rect.y1 for w in line.words) + 1))
-    kept.sort()
-    merged: List[Tuple[float, float]] = []
-    for a, b in kept:
-        if merged and a <= merged[-1][1] + 3:
-            merged[-1] = (merged[-1][0], max(merged[-1][1], b))
-        else:
-            merged.append((a, b))
-    bands: List[Tuple[float, float]] = []
-    top, bottom = 8.0, page_rect.height - 8
-    cursor = top
-    for a, b in merged:
-        if a - cursor > 4:
-            bands.append((cursor, min(a, bottom)))
-        cursor = max(cursor, b)
-    if bottom - cursor > 4:
-        bands.append((cursor, bottom))
-    return [pymupdf.Rect(8, y0, page_rect.width - 8, y1) for y0, y1 in bands]
 
 
 def photo_blob_rects(page: pymupdf.Page, dpi: int = 100) -> List[pymupdf.Rect]:
@@ -1103,16 +1095,17 @@ def collect_hits(lines: List[Line], enabled: set, mode: str, only_ids: Optional[
                         rects.append((r, "birth"))
                     stats["birth"] = stats.get("birth", 0) + 1
     if "person" in enabled and only_ids is None and not keep_ids:
-        for i in range(len(lines) - 1):
-            l1, l2 = lines[i], lines[i + 1]
-            if not l1.words or len(l2.words) < 2:
-                continue
-            last = _cyr(l1.words[-1].text.strip(".,;:"))
-            second = _cyr(l2.words[1].text.strip(".,;:"))
-            if SURNAME_STRICT.search(last.lower()) and PATRONYMIC.search(second.lower()):
-                for r in (l1.words[-1].rect, l2.words[0].rect, l2.words[1].rect):
-                    rects.append((r, "person"))
-                stats["person"] = stats.get("person", 0) + 1
+        for li, a, b in cross_line_name_spans(lines):
+            for r in lines[li].rects_for(a, b):
+                rects.append((r, "person"))
+            stats["person"] = stats.get("person", 0) + 1
+
+    # e-mail и телефон, разорванные переносом строки: «ivanov@» / «example.ru»
+    if "contacts" in enabled:
+        for li, a, b in cross_line_contact_spans(lines):
+            for r in lines[li].rects_for(a, b):
+                rects.append((r, "contacts"))
+            stats["contacts"] = stats.get("contacts", 0) + 1
 
     # подпись без значения, а само значение — на следующей строке (частый случай в сканах)
     if not keep_ids:
@@ -1195,7 +1188,7 @@ def collect_hits(lines: List[Line], enabled: set, mode: str, only_ids: Optional[
                 low = m.group().lower()
                 if low in NAME_STOP or low in CAPS_HYPHEN_STOP:
                     continue
-                if not (low in GIVEN_NAMES or SURNAME_STRICT.search(low) or PATRONYMIC.search(low)):
+                if not (_given_like(low) or SURNAME_STRICT.search(low) or PATRONYMIC.search(low)):
                     continue
                 for r in line.rects_for(m.start(), m.end()):
                     rects.append((r, "person"))
@@ -1235,7 +1228,7 @@ def collect_hits(lines: List[Line], enabled: set, mode: str, only_ids: Optional[
                 low = _cyr(word).lower()
                 if not re.fullmatch(r"[А-ЯЁ][А-Яа-яЁё\-]{2,}", _cyr(word)):
                     continue
-                if low in GIVEN_NAMES or PATRONYMIC.search(low):
+                if _given_like(low) or PATRONYMIC.search(low):
                     rects.append((w.rect, "person"))
                     stats["person"] = stats.get("person", 0) + 1
 
@@ -1469,55 +1462,6 @@ def _dedupe_words(words: List[Word]) -> List[Word]:
     return out
 
 
-def document_crops(page: pymupdf.Page, words: List[Word], limit: int = 2) -> List[pymupdf.Rect]:
-    """Область самого документа на фото: где краска, там и бланк."""
-    try:
-        pix = page.get_pixmap(dpi=120, colorspace=pymupdf.csGRAY, alpha=False)
-    except Exception:
-        return []
-    im = Image.frombytes("L", (pix.width, pix.height), pix.samples)
-    mask = im.point(lambda v: 255 if v < 170 else 0)
-    bbox = mask.getbbox()
-    if not bbox:
-        return []
-    sc = 120.0 / 72.0
-    x0, y0, x1, y1 = bbox
-    box = pymupdf.Rect(x0 / sc, y0 / sc, x1 / sc, y1 / sc)
-    page_area = page.rect.width * page.rect.height
-    if box.get_area() < page_area * 0.05 or box.get_area() > page_area * 0.98:
-        return []
-    if box.width < 60 or box.height < 60:
-        return []
-    # если внутри уже всё прочитано — дочитывать нечего
-    inside = sum(1 for w in words if box.contains(w.rect))
-    if inside >= 25:
-        return []
-    pad = 6.0
-    return [pymupdf.Rect(max(0, box.x0 - pad), max(0, box.y0 - pad),
-                         min(page.rect.width, box.x1 + pad), min(page.rect.height, box.y1 + pad))][:limit]
-
-
-def ocr_crop(page: pymupdf.Page, crop: pymupdf.Rect, exe: str, dpi: int) -> List[Word]:
-    """Распознаёт область документа крупнее: мелкий текст бланка иначе теряется."""
-    scale = max(1.0, min(3.0, 260.0 / max(crop.width, 1)))
-    try:
-        pix = page.get_pixmap(dpi=int(dpi * scale), clip=crop, alpha=False)
-    except Exception:
-        return []
-    with tempfile.TemporaryDirectory() as td:
-        p = os.path.join(td, "crop.png")
-        pix.save(p)
-        rows = _ocr_tsv(p, exe, psm="6")
-    out: List[Word] = []
-    k = 72.0 / (dpi * scale)
-    for ln in _lines_from_tsv(rows, k):
-        for w in ln.words:
-            w.rect = pymupdf.Rect(w.rect.x0 + crop.x0, w.rect.y0 + crop.y0,
-                                  w.rect.x1 + crop.x0, w.rect.y1 + crop.y0)
-            out.append(w)
-    return out
-
-
 def unread_bands(page: pymupdf.Page, words: List[Word], limit: int = 4):
     """Пятна краски без распознанных слов: мелкий шрифт, печати, подписи.
 
@@ -1735,21 +1679,14 @@ def _looks_like_code(im) -> bool:
     return False
 
 
-def _qr_scan_rects(page: pymupdf.Page, dpi: int = 200):
+def _qr_scan_pixels(data, W: int, H: int, stride: int) -> List[Tuple[int, int, int, int]]:
     """Ищет QR (по трём маркерам 1:1:3:1:1) и штрихкоды (по повторяющимся вертикальным полосам).
 
-    Возвращает прямоугольники в координатах страницы. Метод эвристический: ложные
+    Возвращает список (x0, y0, x1, y1) в пикселях растра. Метод эвристический: ложные
     срабатывания отсекаются требованиями к квадратности области и числу маркеров.
     """
-    try:
-        pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, alpha=False)
-    except Exception:
-        return []
-    W, H = pix.width, pix.height
     if W < 100 or H < 100:
         return []
-    data = pix.samples
-    stride = pix.stride
 
     def is_dark(x, y):
         return data[y * stride + x] < 128
@@ -1797,8 +1734,7 @@ def _qr_scan_rects(page: pymupdf.Page, dpi: int = 200):
         else:
             groups.append({"x": cx, "y": cy, "n": 1, "size": size})
 
-    scale = page.rect.width / float(W)
-    rects = []
+    rects: List[Tuple[int, int, int, int]] = []
     solid = [g for g in groups if g["n"] >= 3]
     if len(solid) >= 3:
         xs = [g["x"] for g in solid]
@@ -1807,21 +1743,18 @@ def _qr_scan_rects(page: pymupdf.Page, dpi: int = 200):
         x0, x1 = min(xs) - pad, max(xs) + pad
         y0, y1 = min(ys) - pad, max(ys) + pad
         if x1 > x0 and y1 > y0 and 0.6 <= (x1 - x0) / float(y1 - y0) <= 1.7:
-            rects.append(pymupdf.Rect(x0 * scale, y0 * scale, x1 * scale, y1 * scale))
+            rects.append((x0, y0, x1, y1))
 
     # --- штрихкод: одинаковый узор полос в соседних строках ---
     def row_signature(y):
         sig = []
         prev = False
-        run = 0
         for x in range(W):
             cur = is_dark(x, y)
             if cur == prev:
-                run += 1
-            else:
-                sig.append("1" if prev else "0")
-                prev = cur
-                run = 1
+                continue
+            sig.append("1" if prev else "0")
+            prev = cur
         return "".join(sig)
 
     prev_sig, streak, start_y = None, 0, 0
@@ -1832,18 +1765,25 @@ def _qr_scan_rects(page: pymupdf.Page, dpi: int = 200):
                 start_y = y
             streak += 1
         else:
-            if streak >= 40:
-                band = pymupdf.Rect(0, start_y * scale, W * scale, y * scale)
-                if band.height < page.rect.height * 0.25:
-                    rects.append(band)
+            if streak >= 40 and y - start_y < H * 0.25:
+                rects.append((0, start_y, W, y))
             streak = 0
         prev_sig = sig
-    if streak >= 40:
-        band = pymupdf.Rect(0, start_y * scale, W * scale, H * scale)
-        if band.height < page.rect.height * 0.25:
-            rects.append(band)
+    if streak >= 40 and H - start_y < H * 0.25:
+        rects.append((0, start_y, W, H))
 
     return rects
+
+
+def _qr_scan_rects(page: pymupdf.Page, dpi: int = 200):
+    """QR и штрихкоды на странице — в координатах страницы."""
+    try:
+        pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, alpha=False)
+    except Exception:
+        return []
+    scale = page.rect.width / float(pix.width)
+    return [pymupdf.Rect(x0 * scale, y0 * scale, x1 * scale, y1 * scale)
+            for x0, y0, x1, y1 in _qr_scan_pixels(pix.samples, pix.width, pix.height, pix.stride)]
 
 
 def photo_rects(page) -> List[pymupdf.Rect]:
@@ -1911,20 +1851,6 @@ def ink_bbox(page: pymupdf.Page, dpi: int = 100):
     rect = pymupdf.Rect(x0 / sc, y0 / sc, x1 / sc, y1 / sc)
     dark = sum(mask.histogram()[255:])
     return rect, dark / float(pix.width * pix.height)
-
-
-def fallback_cover(page: pymupdf.Page, boxes: List[pymupdf.Rect]) -> Optional[pymupdf.Rect]:
-    """Страница с краской, но ничего не найдено: закрываем область документа.
-
-    Так бывает на фото паспорта: OCR не читает ни строки, и точечные правила
-    не находят ничего — оставить как есть значит оставить документ открытым.
-    """
-    rect, share = ink_bbox(page)
-    if rect is None or share < 0.08:
-        return None
-    page_area = page.rect.width * page.rect.height
-    covered = sum(b.get_area() for b in boxes) / page_area
-    return rect if covered < 0.01 else None
 
 
 def passport_zones(page: pymupdf.Page, lines: List[Line], hint: bool = False) -> List[pymupdf.Rect]:
@@ -2007,19 +1933,23 @@ def render_pdf(src: str, dst: str, mode: str, enabled: set, ocr: str, dpi: int,
             for pr in passport_pairs(words):
                 rects.append((pr, "identity"))
                 stats["identity"] = stats.get("identity", 0) + 1
-        covers: List[pymupdf.Rect] = []
         if "docno" in enabled:
-            covers += code_rects(page)
+            for r in code_rects(page):
+                rects.append((r, "qr"))
+                stats["qr"] = stats.get("qr", 0) + 1
             if scanned:
-                covers += _qr_scan_rects(page, min(dpi, 250))
+                for r in _qr_scan_rects(page, min(dpi, 250)):
+                    rects.append((r, "qr"))
+                    stats["qr"] = stats.get("qr", 0) + 1
         if ("identity" in enabled or "person" in enabled) and not keep_ids:
-            covers += photo_rects(page)
+            for r in photo_rects(page):
+                rects.append((r, "photos"))
+                stats["photos"] = stats.get("photos", 0) + 1
             # на скане фотография — часть растра, отдельной картинкой её нет
             if scanned:
-                covers += photo_blob_rects(page)
-        if covers:
-            rects.extend((r, "qr") for r in covers)
-            stats["qr"] = stats.get("qr", 0) + len(covers)
+                for r in photo_blob_rects(page):
+                    rects.append((r, "photos"))
+                    stats["photos"] = stats.get("photos", 0) + 1
         limit = page.rect.width * page.rect.height * 0.25
         rects = [(r, c) for r, c in rects if r.width * r.height <= limit]
         boxes = merge_rects([r for r, _ in rects])
@@ -2040,6 +1970,10 @@ def render_pdf(src: str, dst: str, mode: str, enabled: set, ocr: str, dpi: int,
             sc = pix.width / page.rect.width
             for b in boxes:
                 dr.rectangle([b.x0 * sc, b.y0 * sc, b.x1 * sc, b.y1 * sc], fill=BAR_RGB, outline=None)
+            if BAR_BORDER:
+                for b in boxes:
+                    dr.rectangle([b.x0 * sc, b.y0 * sc, b.x1 * sc, b.y1 * sc],
+                                 outline=(110, 110, 110))
             rect = page.rect
             pno = page.number
             doc.delete_page(pno)
@@ -2058,6 +1992,9 @@ def render_pdf(src: str, dst: str, mode: str, enabled: set, ocr: str, dpi: int,
                 if BAR_RGB == (255, 255, 255):
                     # на белой плашке возвращаем линии таблицы; на чёрной они были бы цветными
                     report["restored_lines"] += restore_lines(page, boxes, segs)
+                if BAR_BORDER:
+                    for b in boxes:
+                        page.draw_rect(b, color=(0.55, 0.55, 0.55), width=0.6)
     if not keep_meta:
         doc.set_metadata({})
     try:
@@ -2091,7 +2028,19 @@ def verify_pdf(dst: str, enabled: set, mode: str) -> Dict[str, int]:
 # --------------------------------------------------------------------------- #
 
 
-def render_image(src: str, dst: str, mode: str, enabled: set, keep_ids: bool):
+def _save_image(im: Image.Image, dst: str, fmt: str) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(dst)) or ".", exist_ok=True)
+    if fmt == "JPG":
+        fmt = "JPEG"
+    out_fmt = fmt if fmt in ("PNG", "JPEG", "TIFF", "BMP", "WEBP") else "PNG"
+    save_kwargs = {}
+    if out_fmt == "JPEG":
+        save_kwargs = {"quality": 95, "subsampling": 0}
+    im.save(dst, format=out_fmt, **save_kwargs)
+
+
+def render_image(src: str, dst: Optional[str], mode: str, enabled: set, keep_ids: bool,
+                 save: bool = True):
     exe = find_tesseract()
     if not exe:
         raise RuntimeError("Tesseract не найден: изображения без OCR не обезличить")
@@ -2099,6 +2048,12 @@ def render_image(src: str, dst: str, mode: str, enabled: set, keep_ids: bool):
     fmt = (im.format or "PNG").upper()
     size = pymupdf.Rect(0, 0, im.width, im.height)
     lines = ocr_image(src, exe)
+    full = " ".join(ln.text for ln in lines)
+    if mode == "auto":
+        mode = "judicial" if is_court_act(full) else "document"
+    if mode == "judicial" and enabled == set(CATEGORIES):
+        enabled = set(enabled) - JUDICIAL_KEEP
+    CURRENT["enabled"], CURRENT["mode"] = enabled, mode
     rects, stats = collect_hits(lines, enabled, mode, keep_ids=keep_ids, page_rect=size)
     for extra in (merge_upper_runs(lines),):
         r2, s2 = collect_hits(extra, enabled, mode, only_ids=BLOCK_RULES, keep_ids=keep_ids,
@@ -2106,6 +2061,12 @@ def render_image(src: str, dst: str, mode: str, enabled: set, keep_ids: bool):
         rects += r2
         for k, v in s2.items():
             stats[k] = stats.get(k, 0) + v
+    if "docno" in enabled:
+        # QR-коды и штрихкоды в растре — тем же сканером, что для сканов PDF
+        g = im.convert("L")
+        for x0, y0, x1, y1 in _qr_scan_pixels(g.tobytes(), g.width, g.height, g.width):
+            rects.append((pymupdf.Rect(x0, y0, x1, y1), "qr"))
+            stats["qr"] = stats.get("qr", 0) + 1
     if "identity" in enabled:
         for pr in passport_pairs([w for ln in lines for w in ln.words]):
             rects.append((pr, "identity"))
@@ -2120,12 +2081,18 @@ def render_image(src: str, dst: str, mode: str, enabled: set, keep_ids: bool):
     dr = ImageDraw.Draw(im)
     for b in boxes:
         dr.rectangle([b.x0, b.y0, b.x1, b.y1], fill=BAR_RGB, outline=None)
-    save_kwargs = {}
-    if fmt in ("JPEG", "JPG"):
-        save_kwargs = {"quality": 95, "subsampling": 0}
-    im.save(dst, format=fmt if fmt in ("PNG", "JPEG", "TIFF", "BMP", "WEBP") else "PNG", **save_kwargs)
-    return {"file": os.path.basename(src), "mode": mode, "categories": stats,
-            "boxes": len(boxes), "size": list(im.size)}
+    if BAR_BORDER:
+        for b in boxes:
+            dr.rectangle([b.x0, b.y0, b.x1, b.y1], outline=(110, 110, 110))
+    rep = {"file": os.path.basename(src), "mode": mode, "categories": stats,
+           "boxes": len(boxes), "size": list(im.size), "enabled": enabled}
+    if not save:
+        rep["_image"] = im
+        rep["_fmt"] = fmt
+        return rep
+    _save_image(im, dst, fmt)
+    rep["output"] = dst
+    return rep
 
 
 # --------------------------------------------------------------------------- #
@@ -2205,26 +2172,40 @@ def anonymize_text(text: str, mode: str, enabled: set, keep_ids: bool):
             continue
         text = sub(cat, rid, re.compile(pat, re.I), val, grp)
 
+    tagged: List[Tuple[int, int, str]] = []
+    items = lines_with_offsets(text)
+    aux = [ln for _p, ln in items]
     if "person" in enabled:
-        spans = []
-        for base, ln in lines_with_offsets(text):
-            spans.extend((base + a, base + b) for a, b in find_names(ln) + english_names(ln))
-        spans.sort()
-        merged = []
-        for a, b in spans:
+        for base, ln in items:
+            tagged.extend((base + a, base + b, "person")
+                          for a, b in find_names(ln) + english_names(ln))
+        # ФИО, разорванное по строкам: «Иванов» / «Иван Иванович»
+        for li, a, b in cross_line_name_spans(aux):
+            tagged.append((items[li][0] + a, items[li][0] + b, "person"))
+        # одиночные имена и отчества — как в PDF-пайплайне
+        for m in re.finditer(r"(?<![А-Яа-яЁё])([А-ЯЁ][А-Яа-яЁё\-]{2,})(?![А-Яа-яЁё])", text):
+            low = _cyr(m.group(1)).lower()
+            if _given_like(low) or PATRONYMIC.search(low):
+                tagged.append((m.start(1), m.end(1), "person"))
+    if "contacts" in enabled:
+        for li, a, b in cross_line_contact_spans(aux):
+            tagged.append((items[li][0] + a, items[li][0] + b, "contacts"))
+    if tagged:
+        tagged.sort()
+        merged: List[Tuple[int, int, str]] = []
+        for a, b, cat in tagged:
             if merged and a <= merged[-1][1]:
-                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b), merged[-1][2])
             else:
-                merged.append((a, b))
-        if merged:
-            parts, cur = [], 0
-            for a, b in merged:
-                parts.append(text[cur:a])
-                parts.append(PLACEHOLDER)
-                cur = b
-                stats["person"] = stats.get("person", 0) + 1
-            parts.append(text[cur:])
-            text = "".join(parts)
+                merged.append((a, b, cat))
+        parts, cur = [], 0
+        for a, b, cat in merged:
+            parts.append(text[cur:a])
+            parts.append(PLACEHOLDER)
+            cur = b
+            stats[cat] = stats.get(cat, 0) + 1
+        parts.append(text[cur:])
+        text = "".join(parts)
     return text, stats
 
 
@@ -2371,14 +2352,21 @@ def process(path: str, args, enabled: Optional[set] = None):
 
     if ext in IMAGE_EXT:
         enabled = set(enabled) if enabled is not None else default_enabled(args.mode, args)
-        CURRENT["enabled"], CURRENT["mode"] = enabled, args.mode
+        # режим определяется по OCR внутри render_image; имя результата считаем после
+        rep = render_image(path, None, args.mode, enabled, args.court_keep_ids, save=False)
+        CURRENT["enabled"], CURRENT["mode"] = rep["enabled"], rep["mode"]
         dst = args.out or out_name(path, ext)
-        rep = render_image(path, dst, args.mode, enabled, args.court_keep_ids)
-        rep["kept_categories"] = sorted(set(CATEGORIES) - enabled)
+        _save_image(rep.pop("_image"), dst, rep.pop("_fmt"))
+        rep["kept_categories"] = sorted(set(CATEGORIES) - set(CURRENT["enabled"]))
         rep["output"] = dst
         return rep
 
     if ext in (".docx", ".doc"):
+        if ext == ".doc":
+            with open(path, "rb") as fh:
+                magic = fh.read(8)
+            if magic.startswith(b"\xd0\xcf\x11\xe0") or magic.startswith(b"{\\rtf"):
+                raise SystemExit("устаревший формат .doc: пересохраните файл как .docx или PDF")
         md = docx_to_md(path)
         mode = args.mode
         if mode == "auto":
@@ -2388,6 +2376,7 @@ def process(path: str, args, enabled: Optional[set] = None):
             _, found = collect_hits(lines_from_text(md), enabled, mode)
             enabled = ask_categories(found)
         anon, stats = anonymize_text(md, mode, enabled, args.court_keep_ids)
+        CURRENT["enabled"], CURRENT["mode"] = enabled, mode
         dst = args.out or out_name(path, ".md")
         with open(dst, "w", encoding="utf-8") as f:
             f.write(anon)
@@ -2406,7 +2395,7 @@ def process(path: str, args, enabled: Optional[set] = None):
             _, found = collect_hits(lines_from_text(raw), enabled, mode)
             enabled = ask_categories(found)
         anon, stats = anonymize_text(raw, mode, enabled, args.court_keep_ids)
-        CURRENT["enabled"], CURRENT["mode"] = enabled, args.mode
+        CURRENT["enabled"], CURRENT["mode"] = enabled, mode
         dst = args.out or out_name(path, ext)
         with open(dst, "w", encoding="utf-8") as f:
             f.write(anon)
@@ -2430,7 +2419,7 @@ def default_enabled(mode: str, args) -> set:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    global PLACEHOLDER, SAFE_NAME, BAR_BORDER, TEXT_LAYER, KEEP_NAME
+    global PLACEHOLDER, BAR_BORDER, TEXT_LAYER, KEEP_NAME, BAR_RGB, BAR_FILL
     ap = argparse.ArgumentParser(description="DoctorHide — обезличивание документов")
     ap.add_argument("inputs", nargs="*", help="файлы, маски (docs\\*.pdf) или папки")
     ap.add_argument("-o", "--out", help="файл результата (для одного входа)")
@@ -2447,7 +2436,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     ap.add_argument("--no-text-layer", action="store_true",
                     help="не добавлять невидимый текстовый слой в сканы")
     ap.add_argument("--no-bar-border", action="store_true",
-                    help="плашки без серой обводки (только белая заливка)")
+                    help="плашки без серой обводки (только заливка)")
+    ap.add_argument("--white-bars", action="store_true",
+                    help="белые плашки вместо чёрных (с восстановлением линий таблиц)")
     ap.add_argument("--keep-name", action="store_true",
                     help="сохранить исходное название файла в имени результата")
     ap.add_argument("--safe-name", action="store_true",
@@ -2464,10 +2455,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 0
 
     PLACEHOLDER = args.placeholder
-    SAFE_NAME = args.safe_name
     KEEP_NAME = args.keep_name
     BAR_BORDER = not args.no_bar_border
     TEXT_LAYER = not args.no_text_layer
+    if args.white_bars:
+        BAR_RGB = (255, 255, 255)
+        BAR_FILL = (1.0, 1.0, 1.0)
 
     files: List[str] = []
     for item in args.inputs:

@@ -160,7 +160,7 @@ def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
         # повторная проверка результата: что программа всё-таки нашла в готовом файле
         left = D.verify_pdf(dst, enabled, mode)
         return dst, {"mode": mode, "boxes": rep.get("boxes", 0),
-                     "photos": (rep.get("categories") or {}).get("qr", 0), "leftover": left}
+                     "photos": (rep.get("categories") or {}).get("photos", 0), "leftover": left}
 
     if ext in IMAGE_EXT:
         dst = _unique(os.path.join(dst_dir, D.output_name(name, ext, enabled, "document")))

@@ -20,7 +20,7 @@ import subprocess
 import sys
 
 import pymupdf
-from PIL import Image
+from PIL import Image, ImageDraw
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP = os.path.join(ROOT, "doctorhide.py")
@@ -442,6 +442,121 @@ def main() -> int:
 
     r = run(["нет-такого-файла.pdf"])
     check(r.returncode != 0, "отсутствующий файл обработан как ошибка", f"код {r.returncode}")
+
+    print("\n== ФИО на разных строках, с пустой строкой между частями ==")
+    pdf_lines(os.path.join(WORK, "splitname.pdf"),
+              ["Заявление",
+               "Исполнитель",
+               "Кузнецов",
+               "",
+               "Алексей Дмитриевич"])
+    r = run(["splitname.pdf"])
+    out_sp = os.path.join(WORK, "splitname_hidden.pdf")
+    check(r.returncode == 0 and os.path.exists(out_sp), "код возврата 0", r.stderr.strip()[:120])
+    if os.path.exists(out_sp):
+        text, _, _ = pdf_text(out_sp)
+        flat = norm_text(text)
+        left = [x for x in ("Кузнецов", "Алексей", "Дмитриевич") if x in flat]
+        check(not left, "ФИО через разрыв строк закрыто целиком", f"осталось: {left}")
+
+    print("\n== ФИО на разных строках в md ==")
+    with open(os.path.join(WORK, "splitname.md"), "w", encoding="utf-8") as f:
+        f.write("Заявление\n\nПодпись\n\nВолкова\n\nОльга Сергеевна\n\nДата\n")
+    r = run(["splitname.md"])
+    out_spm = os.path.join(WORK, "splitname_hidden.md")
+    check(os.path.exists(out_spm), "создан splitname_hidden.md")
+    if os.path.exists(out_spm):
+        text = open(out_spm, encoding="utf-8").read()
+        left = [x for x in ("Волкова", "Ольга", "Сергеевна") if x in text]
+        check(not left, "ФИО через разрыв строк в md закрыто", f"осталось: {left}")
+        check("Заявление" in text and "Дата" in text, "текст документа сохранён")
+
+    print("\n== двойные имена ==")
+    pdf_lines(os.path.join(WORK, "double.pdf"),
+              ["Студентка Ветрова Софья-Анна учится",
+               "Также Мария-Луиза Казарян"])
+    r = run(["double.pdf"])
+    out_db = os.path.join(WORK, "double_hidden.pdf")
+    check(r.returncode == 0 and os.path.exists(out_db), "код возврата 0", r.stderr.strip()[:120])
+    if os.path.exists(out_db):
+        text, _, _ = pdf_text(out_db)
+        flat = norm_text(text)
+        left = [x for x in ("Ветрова", "Софья-Анна", "Мария-Луиза", "Казарян") if x in flat]
+        check(not left, "двойные имена закрыты целиком", f"осталось: {left}")
+
+    print("\n== все даты скрываются ==")
+    with open(os.path.join(WORK, "dates.md"), "w", encoding="utf-8") as f:
+        f.write("Собрание 15.03.2024. Дедлайн 01.07.25. Отчёт за 2024 год.\n")
+    r = run(["dates.md"])
+    out_dt = os.path.join(WORK, "dates_hidden.md")
+    check(os.path.exists(out_dt), "создан dates_hidden.md")
+    if os.path.exists(out_dt):
+        text = open(out_dt, encoding="utf-8").read()
+        left = [x for x in ("15.03.2024", "01.07.25", "2024 год") if x in text]
+        check(not left, "числовые даты и год скрыты", f"осталось: {left}")
+
+    print("\n== e-mail через разрыв строки ==")
+    doc = pymupdf.open()
+    page = doc.new_page(width=595, height=842)
+    page.insert_font(fontname="F0", fontfile=r"C:\Windows\Fonts\arial.ttf")
+    page.insert_text((60, 100), "e-mail: ivanov@", fontname="F0", fontsize=11)
+    page.insert_text((60, 118), "example.ru", fontname="F0", fontsize=11)
+    doc.save(os.path.join(WORK, "mail.pdf"))
+    doc.close()
+    r = run(["mail.pdf"])
+    out_ml = os.path.join(WORK, "mail_hidden.pdf")
+    check(r.returncode == 0 and os.path.exists(out_ml), "код возврата 0", r.stderr.strip()[:120])
+    if os.path.exists(out_ml):
+        text, _, _ = pdf_text(out_ml)
+        flat = norm_text(text)
+        left = [x for x in ("ivanov@", "example.ru") if x in flat]
+        check(not left, "e-mail через разрыв строки закрыт", f"осталось: {left}")
+
+    print("\n== телефон без кода страны и счёт с пробелами ==")
+    with open(os.path.join(WORK, "contacts.md"), "w", encoding="utf-8") as f:
+        f.write("тел. 495 123-45-67, р/с 4070 2810 1234 5678 9012 в банке\n")
+    r = run(["contacts.md"])
+    out_ct = os.path.join(WORK, "contacts_hidden.md")
+    check(os.path.exists(out_ct), "создан contacts_hidden.md")
+    if os.path.exists(out_ct):
+        text = open(out_ct, encoding="utf-8").read()
+        left = [x for x in ("495 123-45-67", "4070 2810 1234 5678 9012") if x in text]
+        check(not left, "телефон без +7 и счёт с пробелами скрыты", f"осталось: {left}")
+
+    print("\n== штрихкод в картинке ==")
+    code = Image.new("RGB", (900, 1200), (255, 255, 255))
+    dd = ImageDraw.Draw(code)
+    x = 120
+    while x < 700:
+        dd.rectangle([x, 480, x + 3, 600], fill=(0, 0, 0))
+        x += 6
+    src_code = os.path.join(WORK, "barcode.png")
+    code.save(src_code)
+    r = run(["barcode.png"])
+    out_bc = os.path.join(WORK, "barcode_hidden.png")
+    check(r.returncode == 0 and os.path.exists(out_bc), "код возврата 0", r.stderr.strip()[:120])
+    if os.path.exists(out_bc):
+        im = Image.open(out_bc).convert("L")
+        dark = im.crop((100, 520, 720, 560)).getextrema()
+        check(dark[1] < 80, "штрихкод в картинке закрыт плашкой", f"самый светлый пиксель {dark[1]}")
+
+    print("\n== устаревший бинарный .doc отклонён ==")
+    with open(os.path.join(WORK, "old.doc"), "wb") as f:
+        f.write(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 64)
+    r = run(["old.doc"])
+    check(r.returncode != 0 and not os.path.exists(os.path.join(WORK, "old_hidden.doc")),
+          "бинарный .doc отклонён с понятной ошибкой", r.stderr.strip()[:160])
+
+    print("\n== белые плашки по флагу --white-bars ==")
+    r = run(["doc.pdf", "--white-bars", "-o", "white.pdf"])
+    out_wb = os.path.join(WORK, "white.pdf")
+    check(r.returncode == 0 and os.path.exists(out_wb), "--white-bars обрабатывает PDF",
+          r.stderr.strip()[:120])
+    if os.path.exists(out_wb):
+        text, _, _ = pdf_text(out_wb)
+        flat = norm_text(text)
+        left = [b for b in BANNED_DOC if b in flat]
+        check(not left, "данные скрыты и с белыми плашками", f"осталось: {left}")
 
     failed = [name for ok, name, _ in results if not ok]
     print(f"\nИтог: {len(results) - len(failed)} из {len(results)} проверок пройдено")
