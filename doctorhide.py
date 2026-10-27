@@ -58,6 +58,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -930,23 +931,34 @@ IDENT_DOC_RX = re.compile(
 
 
 # Поля бланков личности: по ним видно, что на странице паспорт/свидетельство/полис.
+# Между словами двусловных подписей допускаем мусор OCR («Дата = рождения»).
 IDENT_FIELDS_RX = re.compile(
-    r"(?<![А-Яа-яЁё])(?:фамили[яюи]|отчество|кем\s+выдан\w*|код\s+подразделения|"
-    r"место\s+рождения|дата\s+рождения|дата\s+выдачи|серия(?:\s+документа)?|"
+    r"(?<![А-Яа-яЁё])(?:фамили[яюи]|отчество|кем\s*[^А-Яа-яЁё\n]{0,4}\s*выдан\w*|код\s+подразделения|"
+    r"место\s*[^А-Яа-яЁё\n]{0,4}\s*рождения|дата\s*[^А-Яа-яЁё\n]{0,4}\s*рождения|"
+    r"дата\s*[^А-Яа-яЁё\n]{0,4}\s*выдачи|серия(?:\s+документа)?|"
     r"страховой\s+номер|снилс|полис\w*|удостоверение\w*|паспорт\w*)(?![А-Яа-яЁё])",
     re.I,
 )
 
 
 def page_has_identity_fields(lines: List[Line], need: int = 2) -> bool:
-    """Страница похожа на бланк личности: есть подписи его полей."""
+    """Страница похожа на бланк личности: есть подписи его полей.
+
+    Для коротких страниц хватает одной подписи: на свидетельствах и полисах
+    OCR вторую подпись часто читает с мусором («Дата = рождения»), и две
+    чистые подписи не набираются — тогда фамилия одним словом оставалась
+    незакрытой."""
     hits = 0
+    n = 0
     for line in lines:
+        if not line.text.strip():
+            continue
+        n += 1
         if IDENT_FIELDS_RX.search(normalize(line.text)):
             hits += 1
         if hits >= need:
             return True
-    return False
+    return hits >= 1 and n <= 12
 
 
 # слова подписей полей: их оставляем читаемыми
@@ -1361,10 +1373,15 @@ def ocr_page(page: pymupdf.Page, exe: str, dpi: int) -> List[Line]:
         p = os.path.join(td, "p.png")
         page.get_pixmap(dpi=dpi, alpha=False).save(p)
         best = _lines_from_tsv(_ocr_tsv(p, exe), 72.0 / dpi)
-        # второй проход «единым блоком»: на фото бланков он часто читает лучше
-        alt = _lines_from_tsv(_ocr_tsv(p, exe, psm="6"), 72.0 / dpi)
-    if _ocr_quality(alt) > _ocr_quality(best) * 1.2:
-        best = alt
+        quality = _ocr_quality(best)
+        # второй проход «единым блоком»: на фото бланков он часто читает лучше.
+        # На странице, которая и так прочиталась хорошо, весь смысл в нём —
+        # экономия: полная страница OCR — самая дорогая операция пайплайна.
+        if quality < 400:
+            alt = _lines_from_tsv(_ocr_tsv(p, exe, psm="6"), 72.0 / dpi)
+            if _ocr_quality(alt) > quality * 1.2:
+                best = alt
+                quality = _ocr_quality(best)
     words = [w for ln in best for w in ln.words]
     # мелкий шрифт в углах страницы Tesseract часто теряет при разборе всей страницы;
     # непрочитанные полосы дочитываем отдельными фрагментами
@@ -1383,24 +1400,29 @@ def ocr_page(page: pymupdf.Page, exe: str, dpi: int) -> List[Line]:
                                       w.rect.x1 + band.x0, w.rect.y1 + band.y0)
                 words.append(w)
     # область документа читаем полосами крупно: MRZ и поля бланка целиком
-    # на полном развороте теряются
-    for band in ocr_bands(page):
-        try:
-            pix = page.get_pixmap(dpi=int(dpi * 2), clip=band, alpha=False)
-        except Exception:
-            continue
-        with tempfile.TemporaryDirectory() as td:
-            p = os.path.join(td, "band2.png")
-            pix.save(p)
-            rows = _ocr_tsv(p, exe, psm="6")
-        for ln in _lines_from_tsv(rows, 72.0 / (dpi * 2)):
-            for w in ln.words:
-                w.rect = pymupdf.Rect(w.rect.x0 + band.x0, w.rect.y0 + band.y0,
-                                      w.rect.x1 + band.x0, w.rect.y1 + band.y0)
-                words.append(w)
+    # на полном развороте теряются. На чётко прочитанной не-бланковой странице
+    # полный проход уже видит всё — три дополнительных прохода ни к чему.
+    identityish = page_has_identity_fields(best) or any(
+        _is_mrz(normalize(ln.text)) for ln in best)
+    if identityish or quality < 300:
+        for band in ocr_bands(page):
+            try:
+                pix = page.get_pixmap(dpi=int(dpi * 2), clip=band, alpha=False)
+            except Exception:
+                continue
+            with tempfile.TemporaryDirectory() as td:
+                p = os.path.join(td, "band2.png")
+                pix.save(p)
+                rows = _ocr_tsv(p, exe, psm="6")
+            for ln in _lines_from_tsv(rows, 72.0 / (dpi * 2)):
+                for w in ln.words:
+                    w.rect = pymupdf.Rect(w.rect.x0 + band.x0, w.rect.y0 + band.y0,
+                                          w.rect.x1 + band.x0, w.rect.y1 + band.y0)
+                    words.append(w)
     # повёрнутые на 90/270° строки (номер по краю бланка, вертикальные штампы):
-    # второй и третий проходы по развёрнутой странице, координаты возвращаем назад
-    if _ocr_quality(best) < 400:
+    # это два полных прохода OCR, на хорошо читаемых страницах они не дают
+    # ничего — разворачиваем только страницы, которые прочитались плохо
+    if quality < 150:
         for angle in (90, 270):
             for w in ocr_rotated(page, exe, dpi, angle):
                 words.append(w)
@@ -1915,12 +1937,17 @@ def passport_photo_rect(page: pymupdf.Page, lines: List[Line], hint: bool = Fals
 
 
 def render_pdf(src: str, dst: str, mode: str, enabled: set, ocr: str, dpi: int,
-               keep_meta: bool, keep_ids: bool):
-    doc = pymupdf.open(src)
+               keep_meta: bool, keep_ids: bool, progress=None):
     exe = find_tesseract()
+    doc = pymupdf.open(src)
     report = {"file": os.path.basename(src), "mode": mode, "pages": doc.page_count,
               "categories": {}, "boxes": 0, "scanned_pages": 0, "restored_lines": 0}
-    for page in doc:
+
+    def analyze(pno: int):
+        # свой handle на файл: PyMuPDF не потокобезопасен, а страницы анализируем
+        # параллельно — Tesseract в это время крутится в подпроцессах
+        d = pymupdf.open(src)
+        page = d[pno]
         lines, extras, words, scanned = _page_lines_and_extras(page, exe, ocr, dpi)
         rects, stats = collect_hits(lines, enabled, mode, keep_ids=keep_ids, page_rect=page.rect)
         for extra in extras:
@@ -1938,7 +1965,7 @@ def render_pdf(src: str, dst: str, mode: str, enabled: set, ocr: str, dpi: int,
                 rects.append((r, "qr"))
                 stats["qr"] = stats.get("qr", 0) + 1
             if scanned:
-                for r in _qr_scan_rects(page, min(dpi, 250)):
+                for r in _qr_scan_rects(page, min(dpi, 150)):
                     rects.append((r, "qr"))
                     stats["qr"] = stats.get("qr", 0) + 1
         if ("identity" in enabled or "person" in enabled) and not keep_ids:
@@ -1953,11 +1980,27 @@ def render_pdf(src: str, dst: str, mode: str, enabled: set, ocr: str, dpi: int,
         limit = page.rect.width * page.rect.height * 0.25
         rects = [(r, c) for r, c in rects if r.width * r.height <= limit]
         boxes = merge_rects([r for r, _ in rects])
+        face = None
         if scanned and "identity" in enabled and not keep_ids:
             face = passport_photo_rect(page, lines, "паспорт" in os.path.basename(src).lower())
-            if face is not None:
-                boxes = merge_rects(boxes + [face])
-                report["photos"] = report.get("photos", 0) + 1
+        d.close()
+        if progress:
+            progress(pno + 1, doc.page_count)
+        return lines, words, scanned, boxes, stats, face
+
+    if doc.page_count > 1:
+        # сканы обрабатываются в несколько потоков: OCR-прогоны независимы,
+        # а последовательная обработка 9 страниц договора занимала 4+ минуты
+        workers = min(4, (os.cpu_count() or 2), doc.page_count)
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            analyzed = list(pool.map(analyze, range(doc.page_count)))
+    else:
+        analyzed = [analyze(0)]
+
+    for page, (lines, words, scanned, boxes, stats, face) in zip(doc, analyzed):
+        if face is not None:
+            boxes = merge_rects(boxes + [face])
+            report["photos"] = report.get("photos", 0) + 1
         report["boxes"] += len(boxes)
         for k, v in stats.items():
             report["categories"][k] = report["categories"].get(k, 0) + v

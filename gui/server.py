@@ -156,7 +156,8 @@ def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
         doc.close()
         mode = "judicial" if D.is_court_act(text) else "document"
         dst = _unique(os.path.join(dst_dir, D.output_name(name, ".pdf", enabled, mode)))
-        rep = D.render_pdf(src, dst, mode, enabled, "auto", 300, False, False)
+        rep = D.render_pdf(src, dst, mode, enabled, "auto", 300, False, False,
+                           progress=lambda n, total: log(f"  {name}: страница {n}/{total}"))
         # повторная проверка результата: что программа всё-таки нашла в готовом файле
         left = D.verify_pdf(dst, enabled, mode)
         return dst, {"mode": mode, "boxes": rep.get("boxes", 0),
