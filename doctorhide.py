@@ -225,9 +225,9 @@ RULES: List[Tuple[str, str, str, Optional[str], int]] = [
     ("identity", "doc_word",
      r"(?:паспорт\w*|загранпаспорт\w*|водительск\w*\s+удостоверени\w*|военн\w+\s+билет\w*|"
      r"свидетельств\w+\s+о\s+рождени\w+|полис\w*\s+ОМС)\s*(?:сери[яию]|№|:)\s*[^\n]{2,60}", None, 0),
-    # серия бланка римскими буквами: «I-АК № 123456», «II-МЮ № 654321»
-    # (буквы OCR часто читает латиницей — АК как AK)
-    ("identity", "doc_series_roman", r"\b[IVX]{1,3}\s*[-–—]\s*[А-ЯЁA-Z]{2}\s*№?\s*\d{6}\b", None, 0),
+    # серия бланка римскими буквами: «III-АК № 123456»; OCR часто читает
+    # часть римских цифр («I-АК») и латиницей («AK») — допускаем оба варианта
+    ("identity", "doc_series_roman", r"\b[IVX]{1,4}\s*[-–—]?\s*[А-ЯЁA-Z]{2}\s*№?\s*\d{6}\b", None, 0),
     # номер актовой записи: по ней находят запись в ЗАГС
     ("docno", "act_no", r"(?:актов\w+\s+запис\w*|запис\w*\s+акта)\s*№?\s*(\d{2,6})", None, 1),
     # дата прописью: «двенадцатого марта тысяча девятьсот семьдесят седьмого года»
@@ -571,14 +571,42 @@ def _tokens(line: Line):
     return _tokens_of(normalize(line.text))
 
 
+def _build_name_forms() -> set:
+    """Падежные формы имён из справочника: в документах они в косвенных
+    падежах («усыновлён Яковлевым-Завальевским Вячеславом Александровичем»),
+    а словарь хранит только именительный."""
+    forms = set()
+    for name in GIVEN_NAMES:
+        forms.add(name)
+        if name.endswith("я"):
+            stem = name[:-1]
+            forms.update((stem + "и", stem + "е", stem + "ю", stem + "ей", stem + "ею"))
+        elif name.endswith("ь"):
+            stem = name[:-1]
+            forms.update((stem + "и", stem + "ью", stem + "ю"))
+        elif name.endswith("й"):
+            stem = name[:-1]
+            forms.update((stem + "я", stem + "ю", stem + "е", stem + "ем", stem + "ему"))
+        elif name.endswith("а"):
+            stem = name[:-1]
+            forms.update((stem + "ы", stem + "е", stem + "у", stem + "ой", stem + "ою"))
+        elif name[-1] in "бвгдклмнпрстфхцчшщ":
+            forms.update((name + "а", name + "у", name + "е", name + "ом", name + "ем"))
+    return forms
+
+
+NAME_FORMS = _build_name_forms()
+
+
 def _given_like(low: str) -> bool:
-    """Имя из справочника или двойное имя: любая часть через дефис — имя
-    («софья-анна», «джан-пьер»). Фамилии двойные ловятся отдельно."""
-    if low in GIVEN_NAMES:
+    """Имя из справочника, его падежная форма или двойное имя:
+    любая часть через дефис — имя («софья-анна», «джан-пьер»).
+    Фамилии двойные ловятся отдельно."""
+    if low in NAME_FORMS:
         return True
     if "-" in low:
         parts = [p for p in low.split("-") if p]
-        return (len(parts) >= 2 and any(p in GIVEN_NAMES for p in parts)
+        return (len(parts) >= 2 and any(p in NAME_FORMS for p in parts)
                 and all(re.fullmatch(r"[а-яё]+", p) for p in parts))
     return False
 
@@ -741,38 +769,48 @@ def cross_line_name_spans(lines: List[Line]) -> List[Tuple[int, int, int]]:
     """ФИО, разорванное по строкам: «Иванов» / «Иван Иванович» — с разрывом или без.
 
     Возвращает (индекс строки, начало, конец) в её нормализованном тексте.
-    Срабатывает на стыке соседних непустых строк, если хвост первой похож на
-    фамилию (или имя), а начало второй — на имя, фамилию или отчество. Строки
-    должны быть визуально близки: зазор не больше пары высот строки — пустая
-    строка между частями ФИО допустима, соседний абзац — нет.
+    Проверяются соседние непустые строки и пара через одну короткую строку:
+    части одного ФИО в формах и таблицах разносят на 2–3 строки. Строки
+    должны быть визуально близки — соседний абзац сюда не подходит.
     """
     spans: List[Tuple[int, int, int]] = []
     idx = [i for i, ln in enumerate(lines) if ln.text.strip()]
     for k in range(len(idx) - 1):
-        i, j = idx[k], idx[k + 1]
-        l1, l2 = lines[i], lines[j]
-        t1, t2 = _tokens(l1), _tokens(l2)
-        if not t1 or not t2 or len(l2.words) > 4:
+        i = idx[k]
+        l1 = lines[i]
+        t1 = _tokens(l1)
+        if not t1:
             continue
-        if l1.words and l2.words:
-            h = max(l1.words[-1].rect.height, l2.words[0].rect.height, 1.0)
-            dy = l2.words[0].rect.y0 - l1.words[-1].rect.y1
-            if dy > max(30.0, 2.4 * h):
+        for kk in (k + 1, k + 2):
+            if kk >= len(idx):
+                break
+            if kk == k + 2 and len(lines[idx[k + 1]].words) > 3:
+                break  # средняя строка содержательная — это не разрыв одного ФИО
+            j = idx[kk]
+            l2 = lines[j]
+            t2 = _tokens(l2)
+            if not t2 or len(l2.words) > 4:
                 continue
-        a, b = _norm_tok(t1[-1][2]), _norm_tok(t2[0][2])
-        if len(a) < 2 or len(b) < 2 or a in NAME_STOP or b in NAME_STOP:
-            continue
-        a_surname = bool(SURNAME_STRICT.search(a))
-        b_surname = bool(SURNAME_STRICT.search(b))
-        pair = ((a_surname and (_given_like(b) or bool(PATRONYMIC.search(b))))
-                or (_given_like(a) and (b_surname or bool(PATRONYMIC.search(b)))))
-        if not pair:
-            continue
-        spans.append((i, t1[-1][0], t1[-1][1]))
-        rest_name_like = len(t2) <= 3 and all(
-            _given_like(_norm_tok(t[2])) or bool(SURNAME.search(_norm_tok(t[2])))
-            or bool(PATRONYMIC.search(_norm_tok(t[2]))) for t in t2)
-        spans.append((j, t2[0][0], t2[-1][1] if rest_name_like else t2[0][1]))
+            if l1.words and l2.words:
+                h = max(l1.words[-1].rect.height, l2.words[0].rect.height, 1.0)
+                dy = l2.words[0].rect.y0 - l1.words[-1].rect.y1
+                if dy > max(40.0 if kk == k + 2 else 30.0, 2.8 * h):
+                    continue
+            a, b = _norm_tok(t1[-1][2]), _norm_tok(t2[0][2])
+            if len(a) < 2 or len(b) < 2 or a in NAME_STOP or b in NAME_STOP:
+                continue
+            a_surname = bool(SURNAME_STRICT.search(a))
+            b_surname = bool(SURNAME_STRICT.search(b))
+            pair = ((a_surname and (_given_like(b) or bool(PATRONYMIC.search(b))))
+                    or (_given_like(a) and (b_surname or bool(PATRONYMIC.search(b)))))
+            if not pair:
+                continue
+            spans.append((i, t1[-1][0], t1[-1][1]))
+            rest_name_like = len(t2) <= 3 and all(
+                _given_like(_norm_tok(t[2])) or bool(SURNAME.search(_norm_tok(t[2])))
+                or bool(PATRONYMIC.search(_norm_tok(t[2]))) for t in t2)
+            spans.append((j, t2[0][0], t2[-1][1] if rest_name_like else t2[0][1]))
+            break
     return spans
 
 
@@ -1450,14 +1488,15 @@ def horizontalize(boxes: Sequence[pymupdf.Rect], lines: Sequence[Line]) -> List[
             x1 = max(min(b.x1, xb + 2.0), xa - 2.0)
             if x1 - x0 < 3:
                 x0, x1 = b.x0, b.x1
-            ny0 = max(b.y0, y0) - 0.8
-            ny1 = min(b.y1, y1) + 0.8
+            ny0 = max(b.y0, y0) - 0.4
+            ny1 = min(b.y1, y1) + 0.4
             if ny1 - ny0 >= 2:
                 out.append(pymupdf.Rect(x0, ny0, x1, ny1))
         if not hit:
             # строк текста рядом нет (рукописное поле без OCR) — оставляем как есть
             out.append(b)
-    return merge_rects(out, pad_x=0.8, pad_y=0.6, row_gap=6.0, row_tol=2.5)
+    # узкие поля: между соседними строками остаётся белая щель
+    return merge_rects(out, pad_x=1.0, pad_y=0.3, row_gap=6.0, row_tol=2.2)
 
 
 def merge_rects(rects: Sequence[pymupdf.Rect], pad_x: float = 1.4, pad_y: float = 1.0,
@@ -2203,8 +2242,8 @@ def passport_photo_rect(page: pymupdf.Page, lines: List[Line], hint: bool = Fals
     w, h = rect.width, rect.height
     if not (0.5 <= w / max(h, 1) <= 1.0) or w * h < page.rect.width * page.rect.height * 0.05:
         return None
-    return pymupdf.Rect(rect.x0 + w * 0.03, rect.y0 + h * 0.53,
-                        rect.x0 + w * 0.44, rect.y0 + h * 0.95)
+    return pymupdf.Rect(rect.x0 + w * 0.05, rect.y0 + h * 0.56,
+                        rect.x0 + w * 0.40, rect.y0 + h * 0.92)
 
 
 def render_pdf(src: str, dst: str, mode: str, enabled: set, ocr: str, dpi: int,
