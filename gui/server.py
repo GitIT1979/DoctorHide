@@ -463,6 +463,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/run":
             with LOCK:
+                if RUNNING["value"]:
+                    self._json(400, {"error": "обработка уже идёт"})
+                    return
                 queued = [f for f in FILES if f["status"] == "queued"]
                 if not queued:
                     self._json(400, {"error": "нет файлов в очереди"})
@@ -472,6 +475,10 @@ class Handler(BaseHTTPRequestHandler):
                     if f["status"] == "error":
                         f["status"] = "queued"
                         f["error"] = None
+                # файл, оставшийся в «running» после сбоя потока, возвращаем в очередь
+                for f in FILES:
+                    if f["status"] == "running":
+                        f["status"] = "queued"
                 RUNNING["value"] = True
             threading.Thread(target=_worker, daemon=True).start()
             log(f"start: {len(queued)} файлов")

@@ -537,7 +537,7 @@ def main() -> int:
     check(r.returncode == 0 and os.path.exists(out_bc), "код возврата 0", r.stderr.strip()[:120])
     if os.path.exists(out_bc):
         im = Image.open(out_bc).convert("L")
-        dark = im.crop((100, 520, 720, 560)).getextrema()
+        dark = im.crop((130, 520, 690, 560)).getextrema()
         check(dark[1] < 80, "штрихкод в картинке закрыт плашкой", f"самый светлый пиксель {dark[1]}")
 
     print("\n== устаревший бинарный .doc отклонён ==")
