@@ -450,8 +450,9 @@ def merge_upper_runs(lines: List[Line]) -> List[Line]:
 
 
 def passport_pairs(words: List[Word]) -> List[pymupdf.Rect]:
-    fours = [w for w in words if re.fullmatch(r"\d{4}", w.text)]
-    sixes = [w for w in words if re.fullmatch(r"\d{6}", w.text)]
+    # OCR цепляет к цифрам пунктуацию («123456,») — отрезаем её
+    fours = [w for w in words if re.fullmatch(r"\d{4}[.,;:]?", w.text)]
+    sixes = [w for w in words if re.fullmatch(r"\d{6}[.,;:]?", w.text)]
     out = []
     for f in fours:
         best = None
@@ -761,13 +762,18 @@ def cross_line_contact_spans(lines: List[Line]) -> List[Tuple[int, int, int]]:
     """E-mail и телефон, разорванные переносом строки: «ivanov@» / «example.ru».
 
     Возвращает (индекс строки, начало, конец) в её нормализованном тексте.
+    OCR на плохих сканах сыплет мусором в хвост строки, поэтому «@» ищем
+    близко к концу строки, а не строго в её конце.
     """
     spans: List[Tuple[int, int, int]] = []
     idx = [i for i, ln in enumerate(lines) if ln.text.strip()]
     for k in range(len(idx) - 1):
         i, j = idx[k], idx[k + 1]
         t1, t2 = normalize(lines[i].text), normalize(lines[j].text)
-        m1 = re.search(r"[\w.+-]+@$", t1)
+        m1 = None
+        for m in re.finditer(r"[\w.+-]+@", t1):
+            if m.end() >= len(t1.rstrip()) - 12:
+                m1 = m
         m2 = re.match(r"([A-Za-zА-Яа-яЁё0-9-]+(?:\.[A-Za-zА-Яа-яЁё0-9-]+)+)", t2)
         if m1 and m2:
             spans.append((i, m1.start(), m1.end()))
@@ -1406,15 +1412,22 @@ def ocr_page(page: pymupdf.Page, exe: str, dpi: int) -> List[Line]:
         _is_mrz(normalize(ln.text)) for ln in best)
     if identityish or quality < 300:
         for band in ocr_bands(page):
+            # полосы читаем крупно, но с потолком по пикселям: 600 dpi на всю
+            # полосу даёт ~20-мегабайтные картинки, и Tesseract жуёт их по 30 с
+            bd = int(dpi * 1.5)
+            cap_px = 2400
+            longest = max(band.width, band.height)
+            if longest * bd / 72.0 > cap_px:
+                bd = max(150, int(cap_px * 72.0 / longest))
             try:
-                pix = page.get_pixmap(dpi=int(dpi * 2), clip=band, alpha=False)
+                pix = page.get_pixmap(dpi=bd, clip=band, alpha=False)
             except Exception:
                 continue
             with tempfile.TemporaryDirectory() as td:
                 p = os.path.join(td, "band2.png")
                 pix.save(p)
                 rows = _ocr_tsv(p, exe, psm="6")
-            for ln in _lines_from_tsv(rows, 72.0 / (dpi * 2)):
+            for ln in _lines_from_tsv(rows, 72.0 / bd):
                 for w in ln.words:
                     w.rect = pymupdf.Rect(w.rect.x0 + band.x0, w.rect.y0 + band.y0,
                                           w.rect.x1 + band.x0, w.rect.y1 + band.y0)
@@ -1422,7 +1435,7 @@ def ocr_page(page: pymupdf.Page, exe: str, dpi: int) -> List[Line]:
     # повёрнутые на 90/270° строки (номер по краю бланка, вертикальные штампы):
     # это два полных прохода OCR, на хорошо читаемых страницах они не дают
     # ничего — разворачиваем только страницы, которые прочитались плохо
-    if quality < 150:
+    if quality < 100:
         for angle in (90, 270):
             for w in ocr_rotated(page, exe, dpi, angle):
                 words.append(w)
@@ -1432,6 +1445,12 @@ def ocr_page(page: pymupdf.Page, exe: str, dpi: int) -> List[Line]:
 def ocr_rotated(page: pymupdf.Page, exe: str, dpi: int, angle: int) -> List[Word]:
     """Распознаёт страницу, повёрнутую на angle (90 или 270), и возвращает координаты назад."""
     step = int(dpi * 0.8)
+    # потолок по пикселям: повёрнутый полный лист иначе уходит в 10+ секунд.
+    # 3000 px — компромисс: A4 при 240 dpi проходит целиком, большие листы режутся
+    cap_px = 3000
+    longest = max(page.rect.width, page.rect.height)
+    if longest * step / 72.0 > cap_px:
+        step = max(120, int(cap_px * 72.0 / longest))
     try:
         pix = page.get_pixmap(dpi=step, alpha=False)
     except Exception:
@@ -1472,14 +1491,40 @@ def ocr_bands(page: pymupdf.Page) -> List[pymupdf.Rect]:
 
 
 def _dedupe_words(words: List[Word]) -> List[Word]:
+    """Убирает дубли слов, оставленные наложенными проходами OCR.
+
+    Плохо читаемая страница даёт тысячи фрагментов, и попарное сравнение
+    превращается в квадратичный цикл на часы. Поэтому — пространственный
+    хэш: слово сравнивается только с соседними ячейками сетки.
+    """
+    cell = 8.0
+    seen: Dict[Tuple[int, int], List[Word]] = {}
     out: List[Word] = []
     for w in words:
         area = w.rect.get_area()
-        if area <= 0:
+        # брызги OCR: реальный текст на скане 300 dpi — это ≥5 pt высотой,
+        # а мусорные фрагменты с шумной страницы дают тысячи слов-пылинок
+        if area <= 0 or w.rect.height < 2.0:
             continue
-        if any(w.rect.intersects(o.rect) and w.rect.intersect(o.rect).get_area() > 0.5 * area
-               for o in out):
+        key = (int(w.rect.x0 // cell), int(w.rect.y0 // cell))
+        dup = False
+        for nx in (key[0] - 1, key[0], key[0] + 1):
+            for ny in (key[1] - 1, key[1], key[1] + 1):
+                for o in seen.get((nx, ny), ()):
+                    # НЕ Rect.intersect(): он мутирует прямоугольник на месте
+                    # и «сплющивает» слова до перевёрнутых карточек
+                    inter_rect = w.rect & o.rect
+                    inter = 0.0 if inter_rect.is_empty else inter_rect.get_area()
+                    if inter > 0.5 * area or inter > 0.5 * o.rect.get_area():
+                        dup = True
+                        break
+                if dup:
+                    break
+            if dup:
+                break
+        if dup:
             continue
+        seen.setdefault(key, []).append(w)
         out.append(w)
     return out
 
