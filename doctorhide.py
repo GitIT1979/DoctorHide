@@ -1330,11 +1330,12 @@ def passport_frame_strips(page: pymupdf.Page, dpi: int = 100) -> List[pymupdf.Re
     if not (page_area * 0.15 <= w * h <= page_area * 0.98) or w / max(h, 1) < 0.5:
         return []
     # полосы с периодом строки паспорта: каждая строка попадает под полосу
-    # независимо от фазы, а белые щели (~0.6% высоты) остаются между ними
+    # независимо от фазы. Щель между полосами тоньше высоты глифа — текст
+    # в неё не проваливается, а белая линия для глаза остаётся
     top = y0 + h * 0.10
     bottom = y1 - h * 0.01
-    pitch = h * 0.033
-    strip_h = pitch * 0.82
+    pitch = h * 0.021
+    strip_h = pitch * 0.78
     out: List[pymupdf.Rect] = []
     y = top
     while y + strip_h <= bottom:
