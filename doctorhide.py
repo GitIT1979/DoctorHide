@@ -761,6 +761,41 @@ def english_names(line: Line) -> List[Tuple[int, int]]:
     return out
 
 
+def vertical_digit_bars(words: List[Word]) -> List[pymupdf.Rect]:
+    """Вертикальные группы цифр (серия/номер, печатные по краю паспорта).
+
+    Повёрнутые проходы OCR читают такую серию словами-столбиками; горизонтальные
+    правила их не видят. Собираем соседние вертикальные «цифровые» слова
+    в одну вертикальную полосу.
+    """
+    vs = [w for w in words
+          if w.rect.height > 2.2 * w.rect.width
+          and re.fullmatch(r"[\d\s.\-/:№]+", w.text.strip() or "")]
+    vs.sort(key=lambda w: ((w.rect.x0 + w.rect.x1) / 2.0, w.rect.y0))
+    groups: List[dict] = []
+    for w in vs:
+        c = (w.rect.x0 + w.rect.x1) / 2.0
+        for g in groups:
+            if abs(g["c"] - c) <= 10.0 and w.rect.y0 - g["y1"] <= 16.0:
+                g["ws"].append(w)
+                g["c"] = (g["c"] * g["n"] + c) / (g["n"] + 1)
+                g["n"] += 1
+                g["y0"] = min(g["y0"], w.rect.y0)
+                g["y1"] = max(g["y1"], w.rect.y1)
+                break
+        else:
+            groups.append({"c": c, "n": 1, "y0": w.rect.y0, "y1": w.rect.y1, "ws": [w]})
+    out: List[pymupdf.Rect] = []
+    for g in groups:
+        if len(g["ws"]) < 2:
+            continue
+        r = g["ws"][0].rect
+        for w in g["ws"][1:]:
+            r = r | w.rect
+        out.append(pymupdf.Rect(r.x0 - 1.5, r.y0 - 1.5, r.x1 + 1.5, r.y1 + 1.5))
+    return out
+
+
 def _norm_tok(tok: str) -> str:
     return _cyr(tok).strip(".,;:()«»\"'").lower()
 
@@ -1117,9 +1152,14 @@ def _is_title_line(line: Line, page_rect: pymupdf.Rect) -> bool:
     return bool(toks) and all(t in TITLE_WORDS for t in toks)
 
 
-def _ink_rows(data, W: int, H: int, stride: int, thresh: int = 185,
-              min_frac: float = 0.015) -> List[Tuple[int, int]]:
-    """Строки растра с краской: (y0, y1) в пикселях, без опоры на OCR."""
+def _ink_rows(data, W: int, H: int, stride: int, thresh: int = 120,
+              min_frac: float = 0.08) -> List[Tuple[int, int]]:
+    """Строки растра с краской: (y0, y1) в пикселях, без опоры на OCR.
+
+    Порог 120 отсекает и тёмный фон фото (стол ~150), и гильош (~170),
+    оставляя чёрные штрихи печати: текстовые строки дают 8–20% тёмных
+    пикселей, фон — 0–5%. Строки темнее 55% — это уже не текст, а пятно
+    фона, они не нужны."""
     step = 3
     bands: List[Tuple[int, int]] = []
     y0 = None
@@ -1131,7 +1171,8 @@ def _ink_rows(data, W: int, H: int, stride: int, thresh: int = 185,
             total += 1
             if data[base + x] < thresh:
                 cnt += 1
-        dark = cnt >= 3 and cnt / total > min_frac
+        frac = cnt / total
+        dark = 0.08 <= frac <= 0.55
         if dark and y0 is None:
             y0 = y
         elif not dark and y0 is not None:
@@ -1148,17 +1189,160 @@ def _ink_rows(data, W: int, H: int, stride: int, thresh: int = 185,
     return [(a, b) for a, b in merged if b - a >= 3]
 
 
+def _band_main_cluster(data, W: int, stride: int, y0: int, y1: int,
+                       thresh: int = 120) -> Optional[Tuple[int, int]]:
+    """Основной кластер краски в полосе: самый широкий слипшийся участок
+    столбцов с тёмными пикселями. Края фото рядом с документом (тёмный стол)
+    так не приклеиваются к текстовому блоку."""
+    cols = [False] * W
+    for yy in range(y0, y1):
+        base = yy * stride
+        for xx in range(0, W, 2):
+            if data[base + xx] < thresh:
+                cols[xx] = True
+    gap_max = max(10, int(W * 0.05))
+    best = None
+    cur = None
+    gap = 0
+    for x, c in enumerate(cols):
+        if c:
+            if cur is None:
+                cur = [x, x]
+            else:
+                cur[1] = x
+            gap = 0
+        elif cur is not None:
+            gap += 2
+            if gap > gap_max:
+                if best is None or cur[1] - cur[0] > best[1] - best[0]:
+                    best = (cur[0], cur[1])
+                cur = None
+                gap = 0
+    if cur is not None and (best is None or cur[1] - cur[0] > best[1] - best[0]):
+        best = (cur[0], cur[1])
+    return best
+
+
+def _band_x_extent(data, W: int, stride: int, y0: int, y1: int, thresh: int = 120) -> Tuple[int, int]:
+    """Горизонтальные границы краски внутри строк y0..y1: (xa, xb) в пикселях."""
+    xa, xb = W, 0
+    for yy in range(y0, y1):
+        base = yy * stride
+        for xx in range(0, W, 2):
+            if data[base + xx] < thresh:
+                xa = min(xa, xx)
+                break
+        for xx in range(W - 1, -1, -2):
+            if data[base + xx] < thresh:
+                xb = max(xb, xx)
+                break
+    return xa, xb
+
+
 def ink_row_bands(page: pymupdf.Page, dpi: int = 150) -> List[pymupdf.Rect]:
     """Горизонтальные полосы по строкам с краской — fallback для бланков,
-    которые OCR читает мусором (гильош)."""
+    которые OCR читает мусором (гильош). Каждая полоса обрезана по фактической
+    ширине краски: пустые поля и пустоты между колонками остаются открытыми,
+    а вертикальная серия получает узкую вертикальную полосу. Строки на всю
+    ширину листа (тёмный стол на фото) отбрасываются."""
     try:
         pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, alpha=False)
     except Exception:
         return []
+    data, W, H, stride = pix.samples, pix.width, pix.height, pix.stride
     sc = 72.0 / dpi
-    bands = _ink_rows(pix.samples, pix.width, pix.height, pix.stride)
-    return [pymupdf.Rect(8, max(0, a * sc - 1.2), page.rect.width - 8,
-                         min(page.rect.height, b * sc + 1.2)) for a, b in bands]
+    bands = _ink_rows(data, W, H, stride)
+    out: List[pymupdf.Rect] = []
+    for a, b in bands:
+        if b - a < 3:
+            continue
+        cluster = _band_main_cluster(data, W, stride, a, b)
+        if cluster is None:
+            continue
+        xa, xb = cluster
+        if (xb - xa) > W * 0.92:
+            continue  # строка на всю ширину — фон/стол, а не текст бланка
+        out.append(pymupdf.Rect(max(0.0, xa * sc - 3.0), max(0.0, a * sc - 1.2),
+                                min(W * sc, (xb + 2) * sc + 3.0),
+                                min(H * sc, b * sc + 1.2)))
+    # если полосы покрывают почти весь лист — скорее всего это тёмный фон,
+    # и fallback только испортит страницу
+    page_area = page.rect.width * page.rect.height
+    if page_area and sum(r.get_area() for r in out) > page_area * 0.75:
+        return []
+    return out
+
+
+def passport_frame_strips(page: pymupdf.Page, dpi: int = 100) -> List[pymupdf.Rect]:
+    """Реестр полос для фото разворота паспорта, который OCR не читает.
+
+    Рамка документа — самый широкий кластер светлых (бумага) строк и
+    столбцов: тёмный стол и рука на фото в неё не входят. Внутри рамки
+    закрывается серия ровных горизонтальных полос с белыми щелями — почти
+    вся площадь разворота это персональные данные (ФИО, даты, место,
+    орган выдачи, серия по краю, MRZ), а верхняя декоративная полоса
+    («Российская Федерация») остаётся открытой."""
+    try:
+        pix = page.get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY, alpha=False)
+    except Exception:
+        return []
+    data, W, H, stride = pix.samples, pix.width, pix.height, pix.stride
+    sc = 72.0 / dpi
+
+    def largest_cluster(flags: List[bool], gap_max: int) -> Optional[Tuple[int, int]]:
+        best = None
+        cur = None
+        gap = 0
+        for i, c in enumerate(flags):
+            if c:
+                if cur is None:
+                    cur = [i, i]
+                else:
+                    cur[1] = i
+                gap = 0
+            elif cur is not None:
+                gap += 1
+                if gap > gap_max:
+                    if best is None or cur[1] - cur[0] > best[1] - best[0]:
+                        best = (cur[0], cur[1])
+                    cur = None
+                    gap = 0
+        if cur is not None and (best is None or cur[1] - cur[0] > best[1] - best[0]):
+            best = (cur[0], cur[1])
+        return best
+
+    col_flags = [False] * W
+    row_flags = [False] * H
+    for y in range(0, H, 2):
+        base = y * stride
+        for x in range(0, W, 2):
+            if data[base + x] > 175:
+                col_flags[x] = True
+                row_flags[y] = True
+    cx = largest_cluster(col_flags, max(8, W // 40))
+    cy = largest_cluster(row_flags, max(8, H // 40))
+    if not cx or not cy:
+        return []
+    x0, x1 = cx[0] * sc, (cx[1] + 2) * sc
+    y0, y1 = cy[0] * sc, (cy[1] + 2) * sc
+    page_area = page.rect.width * page.rect.height
+    w, h = x1 - x0, y1 - y0
+    if not (page_area * 0.15 <= w * h <= page_area * 0.98) or w / max(h, 1) < 0.5:
+        return []
+    # полосы с периодом строки паспорта: каждая строка попадает под полосу
+    # независимо от фазы, а белые щели (~0.6% высоты) остаются между ними
+    top = y0 + h * 0.10
+    bottom = y1 - h * 0.01
+    pitch = h * 0.033
+    strip_h = pitch * 0.82
+    out: List[pymupdf.Rect] = []
+    y = top
+    while y + strip_h <= bottom:
+        out.append(pymupdf.Rect(x0, y, x1, y + strip_h))
+        y += pitch
+    if y < bottom:
+        out.append(pymupdf.Rect(x0, y, x1, bottom))
+    return out
 
 
 def photo_blob_rects(page: pymupdf.Page, dpi: int = 100) -> List[pymupdf.Rect]:
@@ -1462,13 +1646,15 @@ def collect_hits(lines: List[Line], enabled: set, mode: str, only_ids: Optional[
     return rects, stats
 
 
-def horizontalize(boxes: Sequence[pymupdf.Rect], lines: Sequence[Line]) -> List[pymupdf.Rect]:
+def horizontalize(boxes: Sequence[pymupdf.Rect], lines: Sequence[Line],
+                  words: Optional[Sequence[Word]] = None) -> List[pymupdf.Rect]:
     """Текстовые плашки — только горизонтальные полосы по строкам текста.
 
     Каждую плашку разрезаем по визуальным строкам: полоса занимает высоту
-    строки и ширину закрываемого фрагмента. Вертикальные плашки, квадратики
-    и заливка пустот между строками исчезают — остаются ровные полосы,
-    как в кино про «совершенно секретно».
+    строки и ширину закрываемого фрагмента. Вертикальный контент (серия по
+    краю паспорта, повёрнутый штамп) закрывается вертикальной полосой, но
+    только если подтверждён словами с цифрами или осмысленным текстом —
+    мусор OCR с гильоша вертикальными плашками не проходит.
     """
     rows = []
     for ln in lines:
@@ -1479,6 +1665,20 @@ def horizontalize(boxes: Sequence[pymupdf.Rect], lines: Sequence[Line]) -> List[
     rows.sort()
     out: List[pymupdf.Rect] = []
     for b in boxes:
+        # вертикальный контент закрываем вертикальной полосой целиком —
+        # нарезать его по горизонтальным строкам бессмысленно
+        if b.height > 2.5 * b.width and b.height > 18:
+            backed = False
+            if words:
+                for w in words:
+                    if b.intersects(w.rect) and (
+                            re.search(r"\d", w.text)
+                            or len(re.sub(r"[^А-Яа-яЁё]", "", w.text)) >= 4):
+                        backed = True
+                        break
+            if backed:
+                out.append(b)
+            continue
         hit = False
         for y0, y1, xa, xb in rows:
             if b.y1 <= y0 + 1.5 or b.y0 >= y1 - 1.5:
@@ -1705,9 +1905,10 @@ def ocr_rotated(page: pymupdf.Page, exe: str, dpi: int, angle: int) -> List[Word
     for ln in _lines_from_tsv(rows, k):
         for w in ln.words:
             # вертикальный русский текст на бланках не встречается — это
-            # гильош, прочитанный как буквы; вертикальные цифры (серия по
-            # краю паспорта) — как раз нужны
-            if not re.fullmatch(r"[0-9A-Za-z<.\-/:]+", w.text.strip()):
+            # гильош, прочитанный как буквы; вертикальная серия по краю
+            # паспорта состоит из цифр — оставляем только слова с цифрами
+            t = w.text.strip()
+            if not re.fullmatch(r"[0-9A-Za-z<.\-/:№]+", t) or not re.search(r"\d", t):
                 continue
             r = w.rect
             if angle == 90:
@@ -2284,8 +2485,9 @@ def render_pdf(src: str, dst: str, mode: str, enabled: set, ocr: str, dpi: int,
             # пятнистый фон/стол опознавались как «фотография» и закрывались
             # четверти страницы. Упоминаний «паспорт/фамилия» в тексте мало:
             # выписки и договоры их тоже содержат — поэтому только грубые
-            # маркеры бланка (заголовок сверху, MRZ)
-            if page_is_identity_blank(lines, page.rect):
+            # маркеры бланка (заголовок сверху, MRZ) или паспортное имя файла
+            if page_is_identity_blank(lines, page.rect) or \
+                    "паспорт" in os.path.basename(src).lower():
                 for r in photo_rects(page):
                     covers.append(r)
                     stats["photos"] = stats.get("photos", 0) + 1
@@ -2304,40 +2506,51 @@ def render_pdf(src: str, dst: str, mode: str, enabled: set, ocr: str, dpi: int,
         # Предохранитель: если мусор OCR покрывает почти весь лист, fallback
         # не применяем — иначе вместо точечных плашек получится чёрная страница
         identityish_page = (scanned and "identity" in enabled and not keep_ids
-                            and page_is_identity_blank(lines, page.rect))
+                            and ("паспорт" in os.path.basename(src).lower()
+                                 or page_is_identity_blank(lines, page.rect)))
         if identityish_page:
             # разворот паспорта: зоны данных по геометрии бланка (кем выдан,
             # дата, код подразделения, ФИО, место рождения, MRZ) — на плохом
             # фото OCR эти поля не читает, а закрывать весь лист нельзя.
             # Зоны — горизонтальные полосы целиком, не нарезаются по строкам:
             # фон паспорта текстурный, OCR читает его обрывками, и построчная
-            # нарезка превращала зону в кашу из десятков кусков
-            zones = passport_zones(page, lines, "паспорт" in os.path.basename(src).lower())
+            # нарезка превращала зону в кашу из десятков кусков. Страницы без
+            # MRZ и заголовка (18–19 и дальше) зонами не трогаем — их закроет
+            # fallback по строкам с краской
+            has_mrz = any(_is_mrz(normalize(ln.text)) for ln in lines)
+            zones = passport_zones(page, lines,
+                                   has_mrz or page_is_identity_blank(lines, page.rect))
             covers.extend(zones)
-            face = passport_photo_rect(page, lines, "паспорт" in os.path.basename(src).lower())
-            if face is not None:
-                covers.append(face)
-            if not zones and _ocr_quality(lines) < 160:
-                # бланк, который OCR читает мусором (гильош): закрываем полосы
-                # по строкам с краской — вне зависимости от распознанного текста;
-                # заголовок и чистые подписи остаются открытыми
-                kept = []
-                for ln in lines:
-                    if ln.words and (_is_title_line(ln, page.rect) or _is_label_line(ln)):
-                        kept.append((min(w.rect.y0 for w in ln.words) - 1.5,
-                                     max(w.rect.y1 for w in ln.words) + 1.5))
-                bands = []
-                for r in ink_row_bands(page):
-                    # тёмное фото: строки не отделить от фона, fallback
-                    # только зальёт лист — пропускаем
-                    if r.get_area() > page.rect.width * page.rect.height * 0.75:
-                        bands = []
-                        break
-                    if any(r.y0 < b and a < r.y1 for a, b in kept):
-                        continue
-                    bands.append(r)
-                if bands:
-                    boxes = merge_rects(boxes + bands)
+            if stats.get("photos", 0) == 0:
+                # растровое пятно не нашлось — закрываем фото геометрией
+                face = passport_photo_rect(page, lines,
+                                           "паспорт" in os.path.basename(src).lower())
+                if face is not None:
+                    covers.append(face)
+                    stats["photos"] = stats.get("photos", 0) + 1
+            # серия/номер, напечатанные вертикально по краю бланка
+            covers.extend(vertical_digit_bars(words))
+            passport_file = "паспорт" in os.path.basename(src).lower()
+            poor_read = has_mrz or _ocr_quality(lines) < 30
+            if not zones and poor_read:
+                if passport_file:
+                    # фото разворота, который OCR не читает: серия ровных
+                    # полос по рамке документа — вся площадь разворота это
+                    # данные, открытой остаётся только верхняя надпись
+                    covers.extend(passport_frame_strips(page))
+                else:
+                    # бланк, который OCR читает мусором (гильош): закрываем
+                    # полосы по строкам с краской из растра — вне зависимости
+                    # от текста; заголовок и чистые подписи остаются открытыми
+                    kept = []
+                    for ln in lines:
+                        if ln.words and (_is_title_line(ln, page.rect) or _is_label_line(ln)):
+                            kept.append((min(w.rect.y0 for w in ln.words) - 1.5,
+                                         max(w.rect.y1 for w in ln.words) + 1.5))
+                    for r in ink_row_bands(page):
+                        if any(r.y0 < b and a < r.y1 for a, b in kept):
+                            continue
+                        covers.append(r)
         d.close()
         if progress:
             progress(pno + 1, doc.page_count)
@@ -2355,7 +2568,7 @@ def render_pdf(src: str, dst: str, mode: str, enabled: set, ocr: str, dpi: int,
     for page, (lines, words, scanned, boxes, covers, stats) in zip(doc, analyzed):
         # текстовые плашки — горизонтальные полосы по строкам; фото и коды
         # остаются прямоугольниками строго в своих пределах
-        boxes = horizontalize(boxes, lines)
+        boxes = horizontalize(boxes, lines, words)
         all_boxes = boxes + covers
         report["boxes"] += len(all_boxes)
         if stats.get("photos"):
@@ -2473,30 +2686,46 @@ def render_image(src: str, dst: Optional[str], mode: str, enabled: set, keep_ids
         for pr in passport_pairs([w for ln in lines for w in ln.words]):
             rects.append((pr, "identity"))
             stats["identity"] = stats.get("identity", 0) + 1
-        if not keep_ids and page_is_identity_blank(lines, size):
+        if not keep_ids and ("паспорт" in os.path.basename(src).lower()
+                             or page_is_identity_blank(lines, size)):
             for r in blob_rects_in_image(im, size):
                 covers.append(r)
                 stats["identity"] = stats.get("identity", 0) + 1
     boxes = merge_rects([r for r, _ in rects])
     # бланк, который OCR читает мусором: закрываем полосы по строкам с краской
+    has_mrz_img = any(_is_mrz(normalize(ln.text)) for ln in lines)
     if ("identity" in enabled and not keep_ids
-            and page_is_identity_blank(lines, size) and _ocr_quality(lines) < 160):
+            and ("паспорт" in os.path.basename(src).lower()
+                 or page_is_identity_blank(lines, size))
+            and (has_mrz_img or _ocr_quality(lines) < 30)):
         kept = []
         for ln in lines:
             if ln.words and (_is_title_line(ln, size) or _is_label_line(ln)):
                 kept.append((min(w.rect.y0 for w in ln.words) - 1.5,
                              max(w.rect.y1 for w in ln.words) + 1.5))
         g2 = im.convert("L")
-        ink = [pymupdf.Rect(0, max(0, a - 2), size.width, min(size.height, b + 2))
-               for a, b in _ink_rows(g2.tobytes(), g2.width, g2.height, g2.width)]
-        # тёмное фото: строки не отделить от фона — fallback пропускаем
+        raw = g2.tobytes()
+        W, H = g2.width, g2.height
+        ink: List[pymupdf.Rect] = []
+        for a, b in _ink_rows(raw, W, H, W):
+            if b - a < 3:
+                continue
+            cluster = _band_main_cluster(raw, W, W, a, b)
+            if cluster is None:
+                continue
+            xa, xb = cluster
+            if (xb - xa) > W * 0.92:
+                continue  # строка на всю ширину — фон, а не текст бланка
+            ink.append(pymupdf.Rect(max(0, xa - 3), max(0, a - 2),
+                                    min(size.width, xb + 3), min(size.height, b + 2)))
+        # тёмный фон: строки не отделить — fallback пропускаем
         if sum(r.get_area() for r in ink) <= size.width * size.height * 0.75:
             for r in ink:
                 if any(r.y0 < kb and ka < r.y1 for ka, kb in kept):
                     continue
-                boxes = merge_rects(boxes + [r])
+                covers.append(r)
 
-    boxes = horizontalize(boxes, lines)
+    boxes = horizontalize(boxes, lines, [w for ln in lines for w in ln.words])
     all_boxes = boxes + covers
     im = im.convert("RGB")
     dr = ImageDraw.Draw(im)
