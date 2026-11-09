@@ -276,6 +276,7 @@ function row(item){
 }
 
 async function upload(file){
+      if (file && file.name && !/\.(txt|md|markdown|docx|xlsx|pdf)$/i.test(file.name)) return;
   if (queue.length >= MAX){ log('лимит ' + MAX + ' файлов — «' + file.name + '» пропущен', 'err'); return; }
   try{
     const res = await fetch('/api/add?name=' + encodeURIComponent(file.name), { method:'POST', body:file });

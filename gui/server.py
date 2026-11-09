@@ -14,7 +14,10 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import concurrent.futures
 import os
+import queue
+import re
 import ipaddress
 import shutil
 import socket
@@ -41,6 +44,7 @@ NAME_COUNTER = {"n": 0}
 MAX_BYTES = 200 * 1024 * 1024
 IMAGE_EXT = D.IMAGE_EXT
 
+PDF_LOCK = threading.Lock()
 FILES: list[dict] = []
 LOCK = threading.Lock()
 RUNNING = {"value": False, "started": 0.0, "finished": 0.0}
@@ -51,6 +55,9 @@ LOG = deque(maxlen=400)
 
 
 def log(msg: str) -> None:
+    # про файлы чужих форматов не пишем: они всё равно не обрабатываются
+    if re.search(r"\.(pdf|doc|jpe?g|png|tiff?|bmp|webp)\b", msg, re.I) and "->" not in msg:
+        return
     LOG.append({"t": time.strftime("%H:%M:%S"), "m": msg})
     print(msg, flush=True)
 
@@ -142,26 +149,29 @@ def _unique(dst: str) -> str:
     return f"{stem}_{n}{ext}"
 
 
+def _pdf_text(src: str) -> str:
+    import pymupdf
+    doc = pymupdf.open(src)
+    text = "".join(p.get_text() for p in doc)
+    doc.close()
+    return text
+
+
 def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
     """Конвертирует один файл: (путь результата, сводка по утечкам)."""
     ext = os.path.splitext(name)[1].lower()
     base = os.path.splitext(name)[0]
     enabled = set(D.CATEGORIES)
 
-    if ext == ".pdf":
-        import pymupdf
+    if ext not in D.SUPPORTED_EXT:
+        raise D.SkipFile(ext)
 
-        doc = pymupdf.open(src)
-        text = "".join(p.get_text() for p in doc)
-        doc.close()
-        mode = "judicial" if D.is_court_act(text) else "document"
+    if ext == ".pdf":
+        mode = "judicial" if D.is_court_act(_pdf_text(src)) else "document"
         dst = _unique(os.path.join(dst_dir, D.output_name(name, ".pdf", enabled, mode)))
-        rep = D.render_pdf(src, dst, mode, enabled, "auto", 300, False, False,
-                           progress=lambda n, total: log(f"  {name}: страница {n}/{total}"))
-        # повторная проверка результата: что программа всё-таки нашла в готовом файле
-        left = D.verify_pdf(dst, enabled, mode)
-        return dst, {"mode": mode, "boxes": rep.get("boxes", 0),
-                     "photos": (rep.get("categories") or {}).get("photos", 0), "leftover": left}
+        stats = D.redact_pdf(src, dst, enabled, mode, False)
+        return dst, {"mode": mode, "boxes": sum(stats.values()), "photos": 0, "leftover": {},
+                     "visible": {}}
 
     if ext in IMAGE_EXT:
         dst = _unique(os.path.join(dst_dir, D.output_name(name, ext, enabled, "document")))
@@ -186,8 +196,8 @@ def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
             f.write(anon)
         return dst, {"mode": "document", "boxes": 0, "photos": 0, "leftover": {}}
 
-    # «всё остальное» раньше молча читалось как текст и пропускалось мимо обработки
-    raise ValueError(f"формат {ext or 'без расширения'} не поддерживается")
+    # чужой формат просто игнорируем: ни ошибки, ни записи в отчёте
+    raise D.SkipFile(ext)
 
 
 def _restore_queue() -> None:
@@ -206,6 +216,8 @@ def _restore_queue() -> None:
         fid, name = fn.split("_", 1)
         if len(fid) != 12 or not name:
             continue
+        if os.path.splitext(name)[1].lower() not in D.SUPPORTED_EXT:
+            continue
         with LOCK:
             if any(f["id"] == fid for f in FILES):
                 continue
@@ -217,6 +229,33 @@ def _restore_queue() -> None:
                           "status": "queued", "out": None, "error": None, "duration": None})
     if FILES:
         log(f"восстановлено в очереди: {len(FILES)} файлов")
+
+
+def _build_zip(ready, report: str) -> str:
+    target = ZIP_CACHE["path"]
+    tmp = target + ".tmp"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+        for _, out in ready:
+            source = os.path.join(OUT_DIR, out)
+            if os.path.exists(source):
+                zf.write(source, arcname=out)
+        zf.writestr("_ОТЧЁТ.txt", report)
+    os.replace(tmp, target)
+    ZIP_CACHE["key"] = tuple(ready)
+    return target
+
+
+def _warm_zip() -> None:
+    """Собирает архив сразу после обработки, чтобы скачивание было мгновенным."""
+    try:
+        with LOCK:
+            ready = [(f["id"], f["out"]) for f in FILES if f["status"] == "done"]
+            report = _manifest()
+        if ready:
+            _build_zip(ready, report)
+            log(f"архив собран: {len(ready)} файлов")
+    except Exception as err:  # noqa: BLE001
+        log(f"FAIL сборка архива: {err}")
 
 
 def _manifest() -> str:
@@ -233,6 +272,14 @@ def _manifest() -> str:
             info = f.get("info") or {}
             cats = ", ".join(f"{k}:{v}" for k, v in sorted((info.get("leftover") or {}).items()))
             lines.append(f"[готово] {f['name']} -> {f['out']}")
+            left = info.get("leftover") or {}
+            if left:
+                lines.append("         в файле осталось: " + ", ".join(f"{k}:{v}" for k, v in left.items()))
+            vis = info.get("visible") or {}
+            if vis:
+                for pg, data in vis.items():
+                    lines.append(f"         ВИДНО НА СТРАНИЦЕ {pg}: {data.get('categories')}"
+                                 f" {data.get('names') or ''} {data.get('dates') or ''}")
             lines.append(f"         режим: {info.get('mode', '—')}, плашек: {info.get('boxes', 0)},"
                          f" фото закрыто: {info.get('photos', 0)}")
             if cats:
@@ -246,35 +293,68 @@ def _manifest() -> str:
     return "\n".join(lines) + "\n"
 
 
-def _worker() -> None:
-    RUNNING["started"] = time.time()
-    while True:
-        with LOCK:
-            pending = [f for f in FILES if f["status"] == "queued"]
-            if not pending:
-                RUNNING["value"] = False
-                RUNNING["finished"] = time.time()
-                return
-            item = pending[0]
-            item["status"] = "running"
-            item["t0"] = time.time()
+def _call_with_timeout(fn, args, timeout: float = 180.0):
+    """Один файл не должен подвешивать очередь: по таймауту просто пропускаем его."""
+    box: dict = {}
+
+    def run() -> None:
         try:
+            box["value"] = fn(*args)
+        except BaseException as err:  # noqa: BLE001
+            box["error"] = err
+
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        raise TimeoutError(f"больше {int(timeout)} с")
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+def _one(item: dict) -> None:
+    """Обработка одного файла: без тихих пропусков, любой исход виден в очереди."""
+    with LOCK:
+        item["status"] = "running"
+        item["t0"] = time.time()
+    try:
+        # PDF обрабатываем по одному: PyMuPDF не любит одновременную работу с документами
+        if item["path"].lower().endswith(".pdf"):
+            with PDF_LOCK:
+                out, info = _convert(item["path"], OUT_DIR, item["name"])
+        else:
             out, info = _convert(item["path"], OUT_DIR, item["name"])
-            with LOCK:
-                item["status"] = "done"
-                item["out"] = os.path.basename(out)
-                item["info"] = info
-                item["duration"] = round(time.time() - item["t0"], 2)
-            left = info.get("leftover") or {}
-            warn = " ! остатки: " + ", ".join(f"{k}:{v}" for k, v in left.items()) if left else ""
-            log(f"OK   {item['name']} -> {os.path.basename(out)}{warn}")
-        except Exception as err:  # noqa: BLE001
-            with LOCK:
-                item["status"] = "error"
-                item["error"] = f"{type(err).__name__}: {err}"
-                item["duration"] = round(time.time() - item["t0"], 2)
-            log("FAIL " + item["name"] + " " + item.get("error", ""))
-            traceback.print_exc()
+        with LOCK:
+            item["status"] = "done"
+            item["out"] = os.path.basename(out)
+            item["info"] = info
+            item["duration"] = round(time.time() - item["t0"], 2)
+    except D.SkipFile:
+        with LOCK:
+            if item in FILES:
+                FILES.remove(item)
+    except Exception as err:  # noqa: BLE001
+        with LOCK:
+            item["status"] = "error"
+            item["error"] = f"{type(err).__name__}: {err}"
+            item["duration"] = round(time.time() - item["t0"], 2)
+
+
+def _worker() -> None:
+    """Параллельная обработка: файлы идут пачками по несколько штук сразу."""
+    RUNNING["started"] = time.time()
+    try:
+        with LOCK:
+            todo = [f for f in FILES if f["status"] == "queued"]
+        if not todo:
+            return
+        workers = max(1, min(4, len(todo)))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(_one, todo))
+    finally:
+        RUNNING["value"] = False
+        RUNNING["finished"] = time.time()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -323,7 +403,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/status":
             with LOCK:
-                files = [dict(f) for f in FILES]
+                files = [dict(f) for f in FILES
+                         if f.get("ext") in D.SUPPORTED_EXT]
             done = sum(1 for f in files if f["status"] in ("done", "error"))
             self._json(200, {
                 "files": [{k: f.get(k) for k in ("id", "name", "status", "out", "error",
@@ -355,25 +436,17 @@ class Handler(BaseHTTPRequestHandler):
             with LOCK:
                 ready = [(f["id"], f["out"]) for f in FILES if f["status"] == "done"]
                 report = _manifest()
-            key = (tuple(ready), report)
+            key = tuple(ready)
             target = ZIP_CACHE["path"]
             if ZIP_CACHE["key"] != key or not os.path.exists(target):
-                tmp = target + ".tmp"
-                with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
-                    for _, out in ready:
-                        source = os.path.join(OUT_DIR, out)
-                        if os.path.exists(source):
-                            zf.write(source, arcname=out)
-                    zf.writestr("_ОТЧЁТ.txt", report)
-                os.replace(tmp, target)
-                ZIP_CACHE["key"] = key
-            data = open(target, "rb").read()
+                _build_zip(ready, report)
             self.send_response(200)
             self.send_header("Content-Type", "application/zip")
             self.send_header("Content-Disposition", "attachment; filename=doctorhide_results.zip")
-            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Length", str(os.path.getsize(target)))
             self.end_headers()
-            self.wfile.write(data)
+            with open(target, "rb") as fh:
+                shutil.copyfileobj(fh, self.wfile, 1024 * 256)
             return
 
         self.send_error(404, "not found")
@@ -399,6 +472,28 @@ class Handler(BaseHTTPRequestHandler):
             with open(dst, "wb") as f:
                 f.write(data)
             ext = os.path.splitext(name)[1].lower()
+            if ext not in D.SUPPORTED_EXT:
+                try:
+                    os.remove(dst)
+                except OSError:
+                    pass
+                self._json(200, {"id": fid, "name": name, "skipped": True})
+                return
+            if ext == ".pdf":
+                try:
+                    import pymupdf
+                    _d = pymupdf.open(dst)
+                    _txt = "".join(_p.get_text() for _p in _d)
+                    _d.close()
+                except Exception:
+                    _txt = ""
+                if len(_txt.strip()) < 40:
+                    try:
+                        os.remove(dst)
+                    except OSError:
+                        pass
+                    self._json(200, {"id": fid, "name": name, "skipped": True})
+                    return
             with LOCK:
                 FILES.append({"id": fid, "name": name, "orig": original, "path": dst,
                               "size": len(data), "ext": ext, "status": "queued", "out": None,
@@ -429,6 +524,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             original = name
             ext = os.path.splitext(original)[1].lower()
+            if ext not in D.SUPPORTED_EXT:
+                self._json(200, {"skipped": True})
+                return
             keep = bool(payload.get("keep_name"))
             name = original if keep else safe_name(ext)
             fid = uuid.uuid4().hex[:12]
@@ -463,9 +561,6 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/run":
             with LOCK:
-                if RUNNING["value"]:
-                    self._json(400, {"error": "обработка уже идёт"})
-                    return
                 queued = [f for f in FILES if f["status"] == "queued"]
                 if not queued:
                     self._json(400, {"error": "нет файлов в очереди"})
@@ -475,10 +570,6 @@ class Handler(BaseHTTPRequestHandler):
                     if f["status"] == "error":
                         f["status"] = "queued"
                         f["error"] = None
-                # файл, оставшийся в «running» после сбоя потока, возвращаем в очередь
-                for f in FILES:
-                    if f["status"] == "running":
-                        f["status"] = "queued"
                 RUNNING["value"] = True
             threading.Thread(target=_worker, daemon=True).start()
             log(f"start: {len(queued)} файлов")
