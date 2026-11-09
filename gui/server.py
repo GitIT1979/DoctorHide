@@ -20,6 +20,7 @@ import queue
 import re
 import ipaddress
 import shutil
+import subprocess
 import socket
 import sys
 import threading
@@ -167,11 +168,17 @@ def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
         raise D.SkipFile(ext)
 
     if ext == ".pdf":
+        # PDF — отдельным процессом с жёстким таймаутом: зависание не блокирует очередь
         mode = "judicial" if D.is_court_act(_pdf_text(src)) else "document"
         dst = _unique(os.path.join(dst_dir, D.output_name(name, ".pdf", enabled, mode)))
-        stats = D.redact_pdf(src, dst, enabled, mode, False)
-        return dst, {"mode": mode, "boxes": sum(stats.values()), "photos": 0, "leftover": {},
-                     "visible": {}}
+        cmd = [sys.executable, os.path.join(ROOT, "doctorhide.py"), src, "-o", dst, "--keep-name"]
+        try:
+            subprocess.run(cmd, capture_output=True, timeout=120, check=False)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("PDF обрабатывался дольше 120 с — пропущен")
+        if not os.path.exists(dst):
+            raise RuntimeError("PDF не обработан")
+        return dst, {"mode": mode, "boxes": 0, "photos": 0, "leftover": {}, "visible": {}}
 
     if ext in IMAGE_EXT:
         dst = _unique(os.path.join(dst_dir, D.output_name(name, ext, enabled, "document")))
