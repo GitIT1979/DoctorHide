@@ -1,0 +1,25 @@
+Как обновить D:\AI_projects\DoctorHide
+
+1. Закройте программы, которые используют эту папку.
+2. Скопируйте из этой поставки поверх существующих файлов:
+   - doctorhide.py
+   - requirements.txt
+   - README.md
+   - ПРАВИЛА_АНОНИМИЗАЦИИ.md
+   - .gitignore
+   - Запустить DoctorHide.cmd
+   - gui\server.py
+   - gui\README.md
+   - gui\index.html
+   - tests\selftest.py
+   (при желании — остальные файлы из этой папки)
+
+3. В PowerShell:
+   cd D:\AI_projects\DoctorHide
+   pip install -r requirements.txt
+   git add -A
+   git status
+   git commit -m "Align DoctorHide: black bars, text PDF only, skip report, judicial hides all"
+   git push origin main
+
+4. Не коммитьте папки _private, _gui_work, результаты и любые реальные документы с ПДн.

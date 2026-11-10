@@ -1,14 +1,26 @@
-# исходники с персональными данными и рабочие каталоги не должны попадать в репозиторий
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Рабочие / приватные каталоги (ПДн)
+_private/
+_gui_work/
 _check/
 _ref/
 _tools/
 .zwork/
-*.pyc
-__pycache__/
-_private/
-_gui_work/
-.venv/
 результаты/
 
+# Архивы и результаты обезличивания
 DoctorHide.zip
 *_hidden.*
+report.json
+*.log
+
+# Система
+.DS_Store
+Thumbs.db

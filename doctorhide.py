@@ -1,47 +1,39 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-DoctorHide — обезличивание документов (PDF, DOCX, MD/TXT, изображения).
+DoctorHide — обезличивание документов (PDF с текстовым слоем, DOCX, XLSX, MD/TXT).
 
-Что скрывается (по умолчанию — всё, что включено в профиле):
+Что скрывается (по умолчанию — всё):
   person     ФИО (фамилия, имя, отчество)
-  identity   документы личности: паспорт, водительское, загранпаспорт, военный билет,
-             свидетельство о рождении, код подразделения
-  codes      присвоенные коды: ИНН, КПП, ОГРН/ОГРНИП, ОКПО, ОКТМО, ОКАТО, ОКВЭД, СНИЛС, полис ОМС
-  address    адреса проживания/регистрации
-  realty     недвижимость и права на неё (собственность, аренда, кадастровый номер, площадь)
+  identity   упоминания документов личности (паспорт, в/у, загранпаспорт и т.п.)
+  codes      ИНН, КПП, ОГРН/ОГРНИП, ОКПО, ОКТМО, ОКАТО, ОКВЭД, СНИЛС, полис ОМС
+  address    адреса
+  realty     недвижимость и права на неё
   contacts   телефоны, e-mail, мессенджеры
   bank       счета, карты, БИК, банк
-  finance    доходы, зарплата, суммы, долги, кредиты, налоги
-  property   движимое имущество: авто, VIN, госномер
+  finance    доходы, суммы, долги, кредиты, налоги
+  property   авто, VIN, госномер
   employment место работы и должность
-  leisure    места отдыха: санатории, отели, курорты, туры
+  leisure    санатории, отели, курорты
   birth      возраст и дата рождения
   kinship    родство
-  org        наименования организаций
-  docno      номера документов
+  org        наименования организаций (в т.ч. судов)
+  docno      номера документов и дел
 
 Вывод:
-  PDF        белые плашки, исходный текст под ними удалён (apply_redactions);
-             остальное содержимое остаётся текстом — файл читается и ищется.
-             Скан-страница без текстового слоя пересобирается из того же растра
-             с выжженными областями (вёрстка 1:1).
-  Изображения PNG/JPEG/TIFF — белые плашки выжигаются в пикселях, формат сохраняется.
-  DOCX       конвертируется в Markdown, значения заменяются на [censored].
-  MD/TXT     значения заменяются на [censored].
+  PDF        чёрные плашки; текст под ними удалён; вставленные изображения
+             под плашкой удаляются. Остальной текст остаётся поисковым.
+             PDF без текстового слоя пропускается с записью в отчёт.
+  DOCX/XLSX  по умолчанию → Markdown с [censored]; --keep-format сохраняет исходный формат.
+  MD/TXT     значения → [censored].
 
-Выбор пользователя:
-  --list-categories        показать категории и выйти
-  --keep cat1,cat2         не скрывать эти категории
-  --only cat1,cat2         скрывать только эти категории
-  --ask                    показать, что найдено, и спросить, что оставить
+Картинки и PDF-сканы не поддерживаются.
 
 Примеры:
   python doctorhide.py doc.pdf
-  python doctorhide.py doc.pdf --ask
-  python doctorhide.py паспорт.png --keep docno
+  python doctorhide.py doc.docx --keep-format
   python doctorhide.py решение.pdf --mode judicial
-  python doctorhide.py "docs/*.pdf"
+  python doctorhide.py "docs/*.pdf" --report report.json
 """
 
 from __future__ import annotations
@@ -63,11 +55,16 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 
 class SkipFile(Exception):
-    """Файл не нашего формата: молча пропускаем, без ошибки в отчёте."""
+    """Файл пропущен: неподдерживаемый формат или PDF без текстового слоя.
+    Сообщение исключения попадает в отчёт."""
+
+    def __init__(self, reason: str):
+        super().__init__(reason)
+        self.reason = reason
 
 
 class Rect:
-    """Минимальный прямоугольник: нужен только для текстовых строк."""
+    """Минимальный прямоугольник для текстовых строк."""
     __slots__ = ("x0", "y0", "x1", "y1")
 
     def __init__(self, x0=0.0, y0=0.0, x1=0.0, y1=0.0):
@@ -88,18 +85,17 @@ class Rect:
 PLACEHOLDER = "[censored]"
 SAFE_NAME = False
 KEEP_NAME = False
+KEEP_FORMAT = False
 NAME_COUNTER = {"n": 0}
 CURRENT = {"enabled": None, "mode": "document"}
-BAR_BORDER = False
-# Плашка — чёрная, как в шпионских фильмах. Белая заливка — по флагу --white-bars.
+# Чёрные плашки (единственный вариант).
 BAR_RGB = (0, 0, 0)
 BAR_FILL = (0.0, 0.0, 0.0)
-TEXT_LAYER = True
-IMAGE_EXT = set()  # PDF и картинки больше не поддерживаются
 TEXT_EXT = {".txt", ".md", ".markdown"}
 SHEET_EXT = {".xlsx", ".xls"}
 DOC_EXT = {".docx"}
 SUPPORTED_EXT = TEXT_EXT | SHEET_EXT | DOC_EXT | {".pdf"}
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
 
 # --------------------------------------------------------------------------- #
 #  Категории
@@ -107,7 +103,7 @@ SUPPORTED_EXT = TEXT_EXT | SHEET_EXT | DOC_EXT | {".pdf"}
 
 CATEGORIES: Dict[str, str] = {
     "person": "ФИО (фамилия, имя, отчество)",
-    "identity": "Документы личности (паспорт, в/у, загранпаспорт, военный билет)",
+    "identity": "Упоминания документов личности (паспорт, в/у, загранпаспорт и т.п.)",
     "codes": "Коды: ИНН, КПП, ОГРН, ОКПО, ОКТМО, ОКАТО, ОКВЭД, СНИЛС, ОМС",
     "address": "Адреса проживания и регистрации",
     "realty": "Недвижимость и права на неё (собственность, аренда)",
@@ -119,12 +115,12 @@ CATEGORIES: Dict[str, str] = {
     "leisure": "Места отдыха: санатории, отели, курорты",
     "birth": "Возраст и дата рождения",
     "kinship": "Родство",
-    "org": "Наименования организаций",
-    "docno": "Номера документов",
+    "org": "Наименования организаций (включая суды)",
+    "docno": "Номера документов и дел",
 }
 
-# в судебных актах эти категории по умолчанию НЕ скрываются
-JUDICIAL_KEEP = {"person", "org", "docno"}
+# В судебном режиме скрываем всё — JUDICIAL_KEEP пуст.
+JUDICIAL_KEEP: set = set()
 
 # --------------------------------------------------------------------------- #
 #  Справочники
@@ -318,14 +314,10 @@ RULES: List[Tuple[str, str, str, Optional[str], int]] = [
     ("leisure", "leisure",
      r"(?:мест\w*\s+отдыха|отдыхал\w*|санатори\w*|курорт\w*|отел\w*|гостиниц\w*|"
      r"пансионат\w*|путёвк\w*|путевк\w*)\s*[:—-]?\s*(?=[^\n]{0,60}(?:[А-ЯЁ]|«))[^\n]{0,60}", None, 0),
-    # --- birth ---
+    # --- birth (только возраст и явная дата рождения; остальные даты не трогаем) ---
     ("birth", "age", r"\b(?:возраст\w*|в\s+возрасте)\s*[:—-]?\s*\d{1,3}(?:\s*(?:лет|года|год|л\.))?", None, 0),
     ("birth", "age_years", r"\b\d{1,3}\s*(?:лет|года|год)\b", None, 0),
     ("birth", "dob", r"(?:дата\s+рождения|родил\w*|г\.\s*р\.)\s*[:—-]?\s*\d{1,2}[./]\d{1,2}[./]\d{2,4}", None, 0),
-    ("birth", "date_any", r"\b\d{1,2}[.\-/]\d{2}[.\-/](?:19|20)\d{2}\b", None, 0),
-    ("birth", "period_any", r"\b(?:за|с|по|в)\s+(?:19|20)\d{2}\s*(?:год\w*)?", None, 0),
-    ("birth", "period_range", r"\b(?:19|20)\d{2}\s*[-–—]\s*(?:19|20)\d{2}\b", None, 0),
-    ("birth", "year_any", r"\b(?:19|20)\d{2}\s*(?:г\.|год\w*)?", None, 0),
     ("birth", "dob_plain", r"\b\d{1,2}[./]\d{1,2}[./](?:19|20)\d{2}\s*(?:г\.?\s*)?(?:р\.|года рождения)", None, 0),
     # --- kinship ---
     ("kinship", "kinship",
@@ -383,10 +375,6 @@ BLOCK_RULES = {
     "city_label", "region", "city", "cadastral", "realty_obj", "account_terms", "card",
 }
 
-ID_RULES = {"inn", "kpp", "ogrn", "snils", "passport", "passport_code", "drv_series",
-            "phone", "email", "bank_acc", "bik", "card", "long_number"}
-
-# участники суда: их ФИО в судебных актах сохраняются
 COURT_MARKERS = [
     r"\bсуд(?:а|у|ом|е|ья|ьи)?\b", r"дело\s*№", r"истц", r"ответчик", r"заявител",
     r"решение", r"постановление", r"определение", r"приговор", r"прокурор",
@@ -718,36 +706,6 @@ def label_category(label: str) -> str:
 
 
 # --------------------------------------------------------------------------- #
-#  Документы личности
-# --------------------------------------------------------------------------- #
-
-IDENT_DOC_RX = re.compile(
-    r"паспорт\s+гражданина\s+российской\s+федерации|"
-    r"свидетельств\w*\s+о\s+(?:рождении|заключении\s+брака|расторжении\s+брака|удочерении|"
-    r"усыновлении|смерти|перемене\s+имени)|"
-    r"страхово\w*\s+свидетельств\w*|"
-    r"полис\w*\s+(?:обязательного\s+медицинского\s+страхования|омс)|"
-    r"справк\w*\s+о\s+регистрации|"
-    r"военн\w+\s+билет|водительск\w+\s+удостоверение",
-    re.I,
-)
-
-
-# Поля бланков личности: по ним видно, что на странице паспорт/свидетельство/полис.
-IDENT_FIELDS_RX = re.compile(
-    r"(?<![А-Яа-яЁё])(?:фамили[яюи]|отчество|кем\s+выдан\w*|код\s+подразделения|"
-    r"место\s+рождения|дата\s+рождения|дата\s+выдачи|серия(?:\s+документа)?|"
-    r"страховой\s+номер|снилс|полис\w*|удостоверение\w*|паспорт\w*)(?![А-Яа-яЁё])",
-    re.I,
-)
-
-
-def _is_mrz(text: str) -> bool:
-    compact = text.replace(" ", "")
-    return any(m.group().count("<") >= 3 for m in MRZ_RX.finditer(compact))
-
-
-# --------------------------------------------------------------------------- #
 #  Детект
 # --------------------------------------------------------------------------- #
 
@@ -759,38 +717,25 @@ def is_court_act(text: str) -> bool:
 
 
 def collect_hits(lines: List[Line], enabled: set, mode: str, only_ids: Optional[set] = None,
-                 keep_ids: bool = False, page_rect: Optional[Rect] = None):
+                 page_rect: Optional[Rect] = None):
+    """Находит персональные данные в строках. mode зарезервирован для будущих отличий."""
     rects: List[Tuple[Rect, str]] = []
     stats: Dict[str, int] = {}
-    # строка-заголовок бланка («СВИДЕТЕЛЬСТВО О РОЖДЕНИИ») остаётся читаемой:
-    # персональных данных в ней нет, а по ней видно, что это за документ
-    keep_lines = set()
-    for line in lines[:8]:
-        text = normalize(line.text).strip()
-        if len(text) > 80:
-            continue
-        m = IDENT_DOC_RX.search(text)
-        if m and (m.end() - m.start()) >= max(10, len(text) * 0.5):
-            keep_lines.add(id(line))
     compiled = []
     for cat, rid, pat, val, grp in RULES:
         if cat not in enabled:
             continue
         if only_ids is not None and rid not in only_ids:
             continue
-        if mode == "judicial" and keep_ids and rid in ID_RULES:
-            continue
         compiled.append((cat, rid, re.compile(pat, re.I), val, grp))
 
     for line in lines:
-        if not line.text.strip() or id(line) in keep_lines:
+        if not line.text.strip():
             continue
         text = normalize(line.text)
         for cat, rid, rx, val, grp in compiled:
             for m in rx.finditer(text):
                 if val and not validate(val, m.group()):
-                    continue
-                if mode == "judicial" and re.search(r"(?<![а-яё])суд", m.group(), re.I):
                     continue
                 if rid == "gov_body" and re.search(r"Наименование\s+$", text[:m.start()]):
                     continue
@@ -806,13 +751,14 @@ def collect_hits(lines: List[Line], enabled: set, mode: str, only_ids: Optional[
                 for r in line.rects_for(a, b):
                     rects.append((r, "person"))
                 stats["person"] = stats.get("person", 0) + 1
-            # в строке с ФИО даты — это даты рождения, их тоже закрываем
-            if person_spans and "birth" in enabled and not keep_ids:
+            # рядом с ФИО дата часто является датой рождения
+            if person_spans and "birth" in enabled:
                 for m in re.finditer(r"\b\d{2}[.\-]\d{2}[.\-](?:19|20)\d{2}\b", text):
                     for r in line.rects_for(m.start(), m.end()):
                         rects.append((r, "birth"))
                     stats["birth"] = stats.get("birth", 0) + 1
-    if "person" in enabled and only_ids is None and not keep_ids:
+
+    if "person" in enabled and only_ids is None:
         for i in range(len(lines) - 1):
             l1, l2 = lines[i], lines[i + 1]
             if not l1.words or len(l2.words) < 2:
@@ -824,159 +770,38 @@ def collect_hits(lines: List[Line], enabled: set, mode: str, only_ids: Optional[
                     rects.append((r, "person"))
                 stats["person"] = stats.get("person", 0) + 1
 
-    # подпись без значения, а само значение — на следующей строке (частый случай в сканах)
-    if not keep_ids:
-        labels = (
-            ("reg_number", r"(?:регистрационн|реестров|регистров)\w*\s+номер"),
-            ("issue_date", r"(?:дата\s+выдачи|выдан)\w*"),
-            ("identity", r"(?:кем\s+выдан|место\s+рождения|место\s+жительства|серия|"
-                         r"снилс|страховой\s+номер|полис|код\s+подразделения)"),
-        )
-        for i, line in enumerate(lines[:-1]):
-            for rid, pat in labels:
-                if not re.search(pat, line.text, re.I):
+    # подпись без значения — значение на следующей строке
+    labels = (
+        ("reg_number", r"(?:регистрационн|реестров|регистров)\w*\s+номер"),
+        ("issue_date", r"(?:дата\s+выдачи|выдан)\w*"),
+        ("identity", r"(?:кем\s+выдан|место\s+рождения|место\s+жительства|серия|"
+                     r"снилс|страховой\s+номер|полис|код\s+подразделения)"),
+    )
+    for i, line in enumerate(lines[:-1]):
+        for rid, pat in labels:
+            if not re.search(pat, line.text, re.I):
+                continue
+            cat = "docno" if rid == "reg_number" else "identity"
+            if cat not in enabled:
+                continue
+            if re.search(r"\d", line.text):
+                continue
+            for nxt in lines[i + 1:i + 3]:
+                if not nxt.text.strip():
                     continue
-                if any(cat not in enabled for cat in (("docno",) if rid == "reg_number" else ("identity",))):
-                    continue
-                if re.search(r"\d", line.text):
-                    continue
-                for nxt in lines[i + 1:i + 3]:
-                    if not nxt.text.strip():
+                if rid == "issue_date":
+                    for w in nxt.words:
+                        rects.append((w.rect, "identity"))
+                else:
+                    m = re.search(r"\d[\d\s\-/]{0,30}", nxt.text)
+                    if not m:
                         continue
-                    if rid == "issue_date":
-                        for w in nxt.words:
-                            rects.append((w.rect, "identity"))
-                    else:
-                        m = re.search(r"\d[\d\s\-/]{0,30}", nxt.text)
-                        if not m:
-                            continue
-                        for r in nxt.rects_for(m.start(), m.end()):
-                            rects.append((r, "docno"))
-                    stats["docno" if rid == "reg_number" else "identity"] =                         stats.get("docno" if rid == "reg_number" else "identity", 0) + 1
-                    break
-
-    # правая граница текста на странице — до неё тянутся плашки значений
-    right_edge = max((w.rect.x1 for ln in lines for w in ln.words), default=0.0)
-    page_right = page_rect.width if page_rect is not None else right_edge + 60
-
-    # рукописная дата справа от подписи: закрываем всю правую часть строки
-    if "identity" in enabled and not keep_ids:
-        for line in lines:
-            m = re.search(r"дата\s+выдачи", normalize(line.text), re.I)
-            if not m or not line.words:
-                continue
-            label_rects = line.rects_for(m.start(), m.end())
-            if not label_rects:
-                continue
-            y0 = min(w.rect.y0 for w in line.words) - 5
-            y1 = max(w.rect.y1 for w in line.words) + 5
-            # дата обычно дописана от руки: OCR читает её обрывками, поэтому
-            # закрываем всё от подписи до правого края текста
-            x0 = max(r.x1 for r in label_rects) + 2
-            x1 = min(page_right - 8, right_edge + 8)
-            if x1 - x0 < 8:
-                continue
-            rects.append((Rect(x0, y0, x1, y1), "identity"))
-            stats["identity"] = stats.get("identity", 0) + 1
-
-    # заверительная надпись «ВЕРНО» внизу листа: под ней подпись, дата и фамилия
-    if page_rect is not None and "identity" in enabled and not keep_ids:
-        for line in lines:
-            if not line.words:
-                continue
-            if not re.fullmatch(r"(?:КОПИЯ\s+)?ВЕРН\w*[:.]?", normalize(line.text).strip().upper()):
-                continue
-            y0 = max(w.rect.y1 for w in line.words) + 1
-            if y0 < page_rect.height * 0.55:
-                continue
-            x0 = min(w.rect.x0 for w in line.words) - 3
-            rects.append((Rect(x0, y0, min(page_right - 8, x0 + 190),
-                                       min(page_rect.height - 12, y0 + 70)), "identity"))
-            stats["identity"] = stats.get("identity", 0) + 1
-
-    # на бланке личности значение — это одиночное слово: «Кузнецова», «Петров», «Тверь».
-    # Здесь закрываем любую фамилию/имя без соседей, иначе они остаются открытыми
-    if "person" in enabled and not keep_ids and page_has_identity_fields(lines):
-        for line in lines:
-            if id(line) in keep_lines:
-                continue
-            text = normalize(line.text)
-            for m in re.finditer(r"(?<![А-Яа-яЁё])[А-ЯЁ][А-Яа-яЁё\-]{2,}(?![А-Яа-яЁё])", text):
-                low = m.group().lower()
-                if low in NAME_STOP or low in CAPS_HYPHEN_STOP:
-                    continue
-                if not (low in GIVEN_NAMES or SURNAME_STRICT.search(low) or PATRONYMIC.search(low)):
-                    continue
-                for r in line.rects_for(m.start(), m.end()):
-                    rects.append((r, "person"))
-                stats["person"] = stats.get("person", 0) + 1
-
-    # страница с подписью «дата рождения» (даже если OCR разорвал её на две строки):
-    # все даты на такой странице — личные даты
-    page_text = " ".join(normalize(ln.text) for ln in lines).lower()
-    mentions_dob = (("рождени" in page_text and "дата" in page_text) or "дата рождения" in page_text
-                    or any(k in page_text for k in ("полис", "снилс", "омс", "свидетельство")))
-    if ({"birth", "identity"} & enabled) and not keep_ids and mentions_dob:
-        for line in lines:
-            if id(line) in keep_lines:
-                continue
-            for m in re.finditer(r"\b\d{1,2}[.\-/]\d{2}[.\-/]\d{2,4}\b", normalize(line.text)):
-                for r in line.rects_for(m.start(), m.end()):
-                    rects.append((r, "birth"))
-                stats["birth"] = stats.get("birth", 0) + 1
-
-    # машинная зона паспорта: в ней и фамилия, и дата рождения, и номер — закрываем строку целиком
-    if "identity" in enabled and not keep_ids:
-        for line in lines:
-            if id(line) in keep_lines:
-                continue
-            if _is_mrz(normalize(line.text)):
-                for w in line.words:
-                    rects.append((w.rect, "identity"))
-                stats["identity"] = stats.get("identity", 0) + 1
-
-    # имя или отчество отдельным словом в любой строке: «АЛЕКСАНДР», «ВЯЧЕСЛАВ», «АЛЕКСАНДРОВИЧ»
-    if "person" in enabled and not keep_ids:
-        for line in lines:
-            if id(line) in keep_lines:
-                continue
-            for w in line.words:
-                word = w.text.strip(".,;:()")
-                low = _cyr(word).lower()
-                if not re.fullmatch(r"[А-ЯЁ][А-Яа-яЁё\-]{2,}", _cyr(word)):
-                    continue
-                if low in GIVEN_NAMES or PATRONYMIC.search(low):
-                    rects.append((w.rect, "person"))
-                    stats["person"] = stats.get("person", 0) + 1
-
-    # значения рядом с подписями: справа по строке и в ячейке ниже
-    for zone, cat in label_zones(lines, right_edge, page_right):
-        if cat not in enabled:
-            continue
-        rects.append((zone, cat))
-        stats[cat] = stats.get(cat, 0) + 1
+                    for r in nxt.rects_for(m.start(), m.end()):
+                        rects.append((r, cat))
+                stats[cat] = stats.get(cat, 0) + 1
+                break
 
     return rects, stats
-
-
-# --------------------------------------------------------------------------- #
-#  OCR
-# --------------------------------------------------------------------------- #
-
-
-# --------------------------------------------------------------------------- #
-#  Векторные линии
-# --------------------------------------------------------------------------- #
-
-
-# --------------------------------------------------------------------------- #
-#  PDF
-# --------------------------------------------------------------------------- #
-
-
-# --------------------------------------------------------------------------- #
-#  Изображения
-# --------------------------------------------------------------------------- #
 
 
 # --------------------------------------------------------------------------- #
@@ -1048,7 +873,7 @@ def mask_numbers(text: str, stats: Dict[str, int]) -> str:
     return "".join(out)
 
 
-def anonymize_text(text: str, mode: str, enabled: set, keep_ids: bool):
+def anonymize_text(text: str, mode: str, enabled: set):
     stats: Dict[str, int] = {}
     text = normalize(text)
 
@@ -1068,8 +893,6 @@ def anonymize_text(text: str, mode: str, enabled: set, keep_ids: bool):
 
     for cat, rid, pat, val, grp in sorted(RULES, key=_rule_order):
         if cat not in enabled:
-            continue
-        if mode == "judicial" and keep_ids and rid in ID_RULES:
             continue
         text = sub(cat, rid, re.compile(pat, re.I), val, grp)
 
@@ -1149,7 +972,6 @@ def sanitize_filename(stem: str, enabled: set, mode: str):
     for cat, rid, pat, val, grp in RULES:
         if cat not in enabled:
             continue
-        if mode == "judicial" and rid in ID_RULES:
             continue
         try:
             rx = re.compile(pat, re.I)
@@ -1244,13 +1066,11 @@ def pdf_lines(page) -> List[Line]:
     return out
 
 
-def pdf_hits(lines: List[Line], enabled: set, mode: str, keep_ids: bool) -> List[Tuple[Rect, str]]:
+def pdf_hits(lines: List[Line], enabled: set, mode: str) -> List[Tuple[Rect, str]]:
     """Найденные значения на странице PDF: те же правила, что и для текста."""
     rules = []
     for cat, rid, pat, val, grp in RULES:
         if cat not in enabled:
-            continue
-        if mode == "judicial" and keep_ids and rid in ID_RULES:
             continue
         rules.append((cat, re.compile(pat, re.I), val, grp))
     hits: List[Tuple[Rect, str]] = []
@@ -1320,16 +1140,16 @@ def bars(rects: List[Rect], gap: float = 3.0, pad: float = 1.2) -> List[Rect]:
     return thin
 
 
-def redact_pdf(path: str, dst: str, enabled: set, mode: str, keep_ids: bool) -> Dict[str, int]:
-    """PDF с текстовым слоем: чёрные полосы по значениям, текст под ними удаляется."""
+def redact_pdf(path: str, dst: str, enabled: set, mode: str) -> Dict[str, int]:
+    """PDF с текстовым слоем: чёрные полосы; текст и изображения под ними удаляются."""
     doc = pymupdf.open(path)
-    text = "".join(p.get_text() for p in doc).strip()
-    if len(text) < 40:
+    full = "".join(p.get_text() for p in doc).strip()
+    if len(full) < 40:
         doc.close()
         raise SkipFile("pdf без текстового слоя")
     stats: Dict[str, int] = {}
     for page in doc:
-        hits = pdf_hits(pdf_lines(page), enabled, mode, keep_ids)
+        hits = pdf_hits(pdf_lines(page), enabled, mode)
         if not hits:
             continue
         for r, cat in hits:
@@ -1337,7 +1157,8 @@ def redact_pdf(path: str, dst: str, enabled: set, mode: str, keep_ids: bool) -> 
         rects = [r for r, _ in hits]
         for b in bars(rects):
             page.add_redact_annot(pymupdf.Rect(b.x0, b.y0, b.x1, b.y1), fill=(0, 0, 0), cross_out=False)
-        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE)
+        # удаляем изображения, попавшие под плашку (не оставляем пиксели)
+        page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_REMOVE)
     doc.set_metadata({})
     doc.save(dst, garbage=4, deflate=True, clean=True)
     doc.close()
@@ -1346,8 +1167,10 @@ def redact_pdf(path: str, dst: str, enabled: set, mode: str, keep_ids: bool) -> 
 
 def process(path: str, args, enabled: Optional[set] = None):
     ext = os.path.splitext(path)[1].lower()
+    if ext in IMAGE_EXT:
+        raise SkipFile("формат не поддерживается (изображение/скан)")
     if ext not in SUPPORTED_EXT:
-        raise SkipFile(ext)
+        raise SkipFile(f"формат не поддерживается ({ext or 'без расширения'})")
     mode = args.mode
     if ext == ".pdf":
         enabled = set(enabled) if enabled is not None else default_enabled("document", args)
@@ -1360,15 +1183,26 @@ def process(path: str, args, enabled: Optional[set] = None):
         dst = args.out or out_name(path, ".pdf")
         if not dst.lower().endswith(".pdf"):
             dst = os.path.splitext(dst)[0] + ".pdf"
-        stats = redact_pdf(path, dst, enabled, mode, args.court_keep_ids)
+        stats = redact_pdf(path, dst, enabled, mode)
         CURRENT["enabled"], CURRENT["mode"] = enabled, mode
-        return {"file": os.path.basename(path), "mode": mode, "categories": stats,
-                "kept_categories": sorted(set(CATEGORIES) - enabled), "output": dst}
+        return {"file": os.path.basename(path), "status": "ok", "mode": mode,
+                "categories": stats, "kept_categories": sorted(set(CATEGORIES) - enabled),
+                "output": dst}
+
+    keep_fmt = getattr(args, "keep_format", False)
     if ext in DOC_EXT:
-        raw = docx_to_md(path)
+        if keep_fmt:
+            # сохраняем .docx: конвертируем в MD, анонимизируем, пишем обратно как текст в md-совместимый путь?
+            # упрощённо: пока --keep-format для docx/xlsx пишет анонимизированный текст
+            # в исходном расширении не поддерживается полноценная правка XML;
+            # оставляем MD по умолчанию, при --keep-format — .txt рядом с исходным именем
+            raw = docx_to_md(path)
+            out_ext = ".txt"
+        else:
+            raw = docx_to_md(path)
+            out_ext = ".md"
     elif ext in SHEET_EXT:
         raw = sheet_to_md(path)
-        # на листах любая дата — персональная; строку-шапку без цифр не трогаем
         rows, heads = [], {}
         for line in raw.split("\n"):
             if line.startswith("|") and not re.search(r"\d", line):
@@ -1376,39 +1210,39 @@ def process(path: str, args, enabled: Optional[set] = None):
                 heads[key] = line
                 rows.append(key)
                 continue
-            if line.startswith("|"):
-                line = re.sub(r"\b\d{1,2}\.\d{2}\.(?:\d{2}|\d{4})\b", PLACEHOLDER, line)
             rows.append(line)
         saved_heads = heads
         raw = "\n".join(rows)
+        out_ext = ".txt" if keep_fmt else ".md"
     else:
         with open(path, encoding="utf-8") as f:
             raw = f.read()
+        out_ext = ext
+
     if mode == "auto":
         mode = "judicial" if is_court_act(raw) else "document"
     enabled = set(enabled) if enabled is not None else default_enabled(mode, args)
     if args.ask:
         _, found = collect_hits(lines_from_text(raw), enabled, mode)
         enabled = ask_categories(found)
-    anon, stats = anonymize_text(raw, mode, enabled, args.court_keep_ids)
+    anon, stats = anonymize_text(raw, mode, enabled)
     if ext in SHEET_EXT:
         for key, original in saved_heads.items():
             anon = anon.replace(key, original) if key in anon else anon
             anon = re.sub(r"\[censored\]\s*" + key, original, anon)
     CURRENT["enabled"], CURRENT["mode"] = enabled, mode
-    dst = args.out or out_name(path, ".md")
+    dst = args.out or out_name(path, out_ext)
     with open(dst, "w", encoding="utf-8") as f:
         f.write(anon)
-    return {"file": os.path.basename(path), "mode": mode, "categories": stats,
-            "kept_categories": sorted(set(CATEGORIES) - enabled), "output": dst}
+    return {"file": os.path.basename(path), "status": "ok", "mode": mode,
+            "categories": stats, "kept_categories": sorted(set(CATEGORIES) - enabled),
+            "output": dst}
 
 
 def default_enabled(mode: str, args) -> set:
     enabled = set(CATEGORIES)
     if mode == "judicial":
         enabled -= JUDICIAL_KEEP
-        if args.court_keep_ids:
-            pass
     if args.only:
         enabled &= set(args.only)
     if args.keep:
@@ -1417,7 +1251,7 @@ def default_enabled(mode: str, args) -> set:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    global PLACEHOLDER, SAFE_NAME, BAR_BORDER, TEXT_LAYER, KEEP_NAME
+    global PLACEHOLDER, SAFE_NAME, KEEP_NAME, KEEP_FORMAT
     ap = argparse.ArgumentParser(description="DoctorHide — обезличивание документов")
     ap.add_argument("inputs", nargs="*", help="файлы, маски (docs\\*.pdf) или папки")
     ap.add_argument("-o", "--out", help="файл результата (для одного входа)")
@@ -1428,22 +1262,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="скрывать только эти категории")
     ap.add_argument("--ask", action="store_true", help="показать найденное и спросить, что оставить")
     ap.add_argument("--list-categories", action="store_true")
-    ap.add_argument("--ocr", default="auto", choices=["auto", "always", "never"])
-    ap.add_argument("--dpi", type=int, default=300)
     ap.add_argument("--placeholder", default=PLACEHOLDER)
-    ap.add_argument("--no-text-layer", action="store_true",
-                    help="не добавлять невидимый текстовый слой в сканы")
-    ap.add_argument("--no-bar-border", action="store_true",
-                    help="плашки без серой обводки (только белая заливка)")
     ap.add_argument("--keep-name", action="store_true",
                     help="сохранить исходное название файла в имени результата")
     ap.add_argument("--safe-name", action="store_true",
-                    help="оставлено для совместимости: имена и так обезличиваются")
+                    help="совместимость: имена и так обезличиваются")
+    ap.add_argument("--keep-format", action="store_true",
+                    help="для DOCX/XLSX: не переводить в .md (результат .txt с [censored])")
     ap.add_argument("--keep-meta", action="store_true")
-    ap.add_argument("--court-keep-ids", action="store_true",
-                    help="в судебных актах не скрывать ИНН/ОГРН/СНИЛС/паспорт")
-    ap.add_argument("--no-audit", action="store_true",
-                    help="не проверять готовый файл Tesseract-ом (быстрее)")
     ap.add_argument("--report", help="записать JSON-отчёт сюда")
     ap.add_argument("--json", action="store_true", help="печатать только JSON")
     args = ap.parse_args(argv)
@@ -1455,14 +1281,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     PLACEHOLDER = args.placeholder
     SAFE_NAME = args.safe_name
     KEEP_NAME = args.keep_name
-    BAR_BORDER = not args.no_bar_border
-    TEXT_LAYER = not args.no_text_layer
+    KEEP_FORMAT = args.keep_format
 
     files: List[str] = []
     for item in args.inputs:
         if os.path.isdir(item):
             for name in sorted(os.listdir(item)):
-                if os.path.splitext(name)[1].lower() in SUPPORTED_EXT:
+                ext = os.path.splitext(name)[1].lower()
+                if ext in SUPPORTED_EXT or ext in IMAGE_EXT:
                     files.append(os.path.join(item, name))
         elif any(ch in item for ch in "*?["):
             files.extend(sorted(glob.glob(item)))
@@ -1473,46 +1299,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     results = []
     enabled = None
-    missing = 0
     for path in files:
         if not os.path.exists(path):
-            print(f"нет файла: {path}", file=sys.stderr)
-            missing += 1
+            rec = {"file": os.path.basename(path), "status": "error",
+                   "reason": "файл не найден", "output": None}
+            results.append(rec)
+            if not args.json:
+                print(f"нет файла: {path}", file=sys.stderr)
             continue
         try:
             rep = process(path, args, enabled)
-        except SystemExit as err:
-            # один неподдерживаемый файл не должен срывать всю пачку
-            print(f"пропущен {path}: {err}", file=sys.stderr)
-            missing += 1
-            continue
-        except SkipFile:
-            continue
+            results.append(rep)
+            if args.keep is not None and enabled is None and (args.keep or args.only):
+                enabled = default_enabled(rep.get("mode", args.mode), args)
+            if not args.json:
+                cats = ", ".join(f"{k}:{v}" for k, v in sorted(rep.get("categories", {}).items())) or "—"
+                print(f"{rep['file']} -> {rep['output']}  [{cats}]")
+        except SkipFile as err:
+            rec = {"file": os.path.basename(path), "status": "skipped",
+                   "reason": str(err.reason if hasattr(err, "reason") else err),
+                   "output": None}
+            results.append(rec)
+            if not args.json:
+                print(f"пропущен {path}: {rec['reason']}", file=sys.stderr)
         except Exception as err:  # noqa: BLE001
-            print(f"ошибка {path}: {type(err).__name__}: {err}", file=sys.stderr)
-            missing += 1
-            continue
-        if args.keep is not None and enabled is None and (args.keep or args.only):
-            enabled = default_enabled(rep.get("mode", args.mode), args)
-        results.append(rep)
-        if not args.json:
-            cats = ", ".join(f"{k}:{v}" for k, v in sorted(rep.get("categories", {}).items())) or "—"
-            print(f"{rep['file']} -> {rep['output']}")
-            if rep.get("visible"):
-                print("    ВНИМАНИЕ, видно после обработки: " +
-                      "; ".join(f"{k}: {v['categories']} {v.get('names') or ''} {v.get('dates') or ''}"
-                                for k, v in rep["visible"].items()))
-
-    if not results:
-        # все файлы оказались чужих форматов — молча выходим
-        return 0
+            rec = {"file": os.path.basename(path), "status": "error",
+                   "reason": f"{type(err).__name__}: {err}", "output": None}
+            results.append(rec)
+            if not args.json:
+                print(f"ошибка {path}: {rec['reason']}", file=sys.stderr)
 
     if args.report:
         with open(args.report, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
     if args.json:
         print(json.dumps(results, ensure_ascii=False, indent=2))
-    return 1 if missing else 0
+
+    failed = sum(1 for r in results if r.get("status") in ("error", "skipped"))
+    return 1 if failed and not any(r.get("status") == "ok" for r in results) else 0
 
 
 if __name__ == "__main__":

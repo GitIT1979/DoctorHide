@@ -260,31 +260,19 @@ def main() -> int:
         check("7701234567" not in text, "ИНН скрыт")
         check("Смирнов" not in text, "ФИО скрыто")
 
-    print("\n== скан без текстового слоя ==")
-    r = run(["scan.pdf"])
-    out_scan = os.path.join(WORK, "scan_hidden.pdf")
-    check(r.returncode == 0, "код возврата 0", r.stderr.strip()[:120])
-    if os.path.exists(out_scan):
-        text, pages, _ = pdf_text(out_scan)
-        check(pages == 1, "страница сохранена", str(pages))
-        check(len(text.strip()) > 50, "текстовый слой добавлен", f"{len(text)} символов")
-        flat = norm_text(text)
-        left = [b for b in BANNED_DOC if b in flat]
-        check(not left, "в текстовом слое нет скрытых данных", f"осталось: {left}")
-        shot = os.path.join(WORK, "scan_hidden.png")
-        pymupdf.open(out_scan)[0].get_pixmap(dpi=200).save(shot)
-        whited = whited_pixels(os.path.join(WORK, "doc.png"), shot)
-        check(whited > 300, "пиксели данных выжжены", f"закрыто точек: {whited}")
+    print("\n== скан без текстового слоя (не поддерживается) ==")
+    r = run(["scan.pdf", "--json"])
+    check("без текстового слоя" in (r.stdout + r.stderr) or "skipped" in r.stdout,
+          "скан отмечен как пропущенный", (r.stdout + r.stderr)[:200])
+    check(not os.path.exists(os.path.join(WORK, "scan_hidden.pdf")),
+          "файл результата для скана не создан")
 
-    print("\n== изображение ==")
-    r = run(["doc.png"])
-    out_img = os.path.join(WORK, "doc_hidden.png")
-    check(r.returncode == 0, "код возврата 0", r.stderr.strip()[:120])
-    check(os.path.exists(out_img), "создан doc_hidden.png")
-    if os.path.exists(out_img):
-        check(Image.open(out_img).size == Image.open(png).size, "размер сохранён")
-        whited = whited_pixels(png, out_img)
-        check(whited > 300, "пиксели данных выжжены", f"закрыто точек: {whited}")
+    print("\n== изображение (не поддерживается) ==")
+    r = run(["doc.png", "--json"])
+    check("формат не поддерживается" in (r.stdout + r.stderr) or "skipped" in r.stdout,
+          "картинка отмечена как пропущенная", (r.stdout + r.stderr)[:200])
+    check(not os.path.exists(os.path.join(WORK, "doc_hidden.png")),
+          "файл результата для картинки не создан")
 
     print("\n== фамилия, разорванная OCR ==")
     # сканер читает «ЯКОВЛЕВА-ЗАВАЛЬЕВСКАЯ» двумя кусками: раньше закрывался только хвост

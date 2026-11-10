@@ -6,7 +6,8 @@ DoctorHide GUI — локальный сервер для интерфейса �
 Запуск:  python gui/server.py [--port 8765]
 Открыть: http://127.0.0.1:8765/
 
-Поддерживает до 100 файлов за один прогон: PDF, DOCX, MD/TXT, PNG/JPEG/TIFF/BMP/WEBP.
+Поддерживает до 100 файлов за один прогон: PDF (с текстовым слоем), DOCX, XLSX, MD/TXT.
+Картинки и PDF-сканы не поддерживаются — попадают в отчёт как пропущенные.
 """
 
 from __future__ import annotations
@@ -159,52 +160,57 @@ def _pdf_text(src: str) -> str:
 
 
 def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
-    """Конвертирует один файл: (путь результата, сводка по утечкам)."""
+    """Обрабатывает один файл: (путь результата, сводка)."""
     ext = os.path.splitext(name)[1].lower()
-    base = os.path.splitext(name)[0]
     enabled = set(D.CATEGORIES)
 
+    if ext in D.IMAGE_EXT:
+        raise D.SkipFile("формат не поддерживается (изображение/скан)")
     if ext not in D.SUPPORTED_EXT:
-        raise D.SkipFile(ext)
+        raise D.SkipFile(f"формат не поддерживается ({ext or 'без расширения'})")
 
     if ext == ".pdf":
-        # PDF — отдельным процессом с жёстким таймаутом: зависание не блокирует очередь
         mode = "judicial" if D.is_court_act(_pdf_text(src)) else "document"
         dst = _unique(os.path.join(dst_dir, D.output_name(name, ".pdf", enabled, mode)))
         cmd = [sys.executable, os.path.join(ROOT, "doctorhide.py"), src, "-o", dst, "--keep-name"]
         try:
-            subprocess.run(cmd, capture_output=True, timeout=120, check=False)
+            proc = subprocess.run(cmd, capture_output=True, timeout=120, check=False, text=True)
         except subprocess.TimeoutExpired:
             raise RuntimeError("PDF обрабатывался дольше 120 с — пропущен")
         if not os.path.exists(dst):
-            raise RuntimeError("PDF не обработан")
+            err = (proc.stderr or proc.stdout or "").strip()
+            # doctorhide пишет SkipFile в stderr как «пропущен …: pdf без текстового слоя»
+            if "без текстового слоя" in err or "пропущен" in err:
+                raise D.SkipFile("pdf без текстового слоя")
+            raise RuntimeError(err or "PDF не обработан")
         return dst, {"mode": mode, "boxes": 0, "photos": 0, "leftover": {}, "visible": {}}
-
-    if ext in IMAGE_EXT:
-        dst = _unique(os.path.join(dst_dir, D.output_name(name, ext, enabled, "document")))
-        rep = D.render_image(src, dst, "document", enabled, False)
-        return dst, {"mode": "document", "boxes": rep.get("boxes", 0),
-                     "photos": 0, "leftover": {}}
 
     if ext in (".docx", ".doc"):
         md = D.docx_to_md(src)
-        anon, stats = D.anonymize_text(md, "document", enabled, False)
+        anon, stats = D.anonymize_text(md, "document", enabled)
         dst = _unique(os.path.join(dst_dir, D.output_name(name, ".md", enabled, "document")))
         with open(dst, "w", encoding="utf-8") as f:
             f.write(anon)
-        return dst, {"mode": "document", "boxes": 0, "photos": 0, "leftover": {}}
+        return dst, {"mode": "document", "boxes": sum(stats.values()), "photos": 0, "leftover": {}}
+
+    if ext in (".xlsx", ".xls"):
+        md = D.sheet_to_md(src)
+        anon, stats = D.anonymize_text(md, "document", enabled)
+        dst = _unique(os.path.join(dst_dir, D.output_name(name, ".md", enabled, "document")))
+        with open(dst, "w", encoding="utf-8") as f:
+            f.write(anon)
+        return dst, {"mode": "document", "boxes": sum(stats.values()), "photos": 0, "leftover": {}}
 
     if ext in (".md", ".markdown", ".txt"):
         with open(src, encoding="utf-8", errors="replace") as f:
             raw = f.read()
-        anon, stats = D.anonymize_text(raw, "document", enabled, False)
+        anon, stats = D.anonymize_text(raw, "document", enabled)
         dst = _unique(os.path.join(dst_dir, D.output_name(name, ext, enabled, "document")))
         with open(dst, "w", encoding="utf-8") as f:
             f.write(anon)
-        return dst, {"mode": "document", "boxes": 0, "photos": 0, "leftover": {}}
+        return dst, {"mode": "document", "boxes": sum(stats.values()), "photos": 0, "leftover": {}}
 
-    # чужой формат просто игнорируем: ни ошибки, ни записи в отчёте
-    raise D.SkipFile(ext)
+    raise D.SkipFile(f"формат не поддерживается ({ext})")
 
 
 def _restore_queue() -> None:
@@ -337,15 +343,18 @@ def _one(item: dict) -> None:
             item["out"] = os.path.basename(out)
             item["info"] = info
             item["duration"] = round(time.time() - item["t0"], 2)
-    except D.SkipFile:
+    except D.SkipFile as err:
         with LOCK:
-            if item in FILES:
-                FILES.remove(item)
+            item["status"] = "error"
+            item["error"] = str(getattr(err, "reason", None) or err)
+            item["duration"] = round(time.time() - item["t0"], 2)
+            log(f"пропущен {item['name']}: {item['error']}")
     except Exception as err:  # noqa: BLE001
         with LOCK:
             item["status"] = "error"
             item["error"] = f"{type(err).__name__}: {err}"
             item["duration"] = round(time.time() - item["t0"], 2)
+            log(f"ошибка {item['name']}: {item['error']}")
 
 
 def _worker() -> None:
