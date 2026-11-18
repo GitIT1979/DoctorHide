@@ -218,7 +218,7 @@
 <div class="vault">VAULT 101 · TERMLINK PROTOTYPE · ТОЛЬКО ДЛЯ СЛУЖЕБНОГО ПОЛЬЗОВАНИЯ</div>
 
 <input type="file" id="fileInput" multiple hidden
-       accept=".pdf,.docx,.doc,.md,.markdown,.txt,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp">
+       accept=".pdf,.docx,.doc,.rtf,.xlsx,.xls,.md,.markdown,.txt,.png,.jpg,.jpeg,.tif,.tiff,.bmp,.webp">
 <input type="file" id="dirInput" webkitdirectory directory multiple hidden>
 
 <script>
@@ -276,12 +276,20 @@ function row(item){
 }
 
 async function upload(file){
-      if (file && file.name && !/\.(txt|md|markdown|docx|xlsx|pdf)$/i.test(file.name)) return;
+  const name = (file && file.name || '').trim();
+  if (name && !/\.(txt|md|markdown|docx|doc|rtf|xlsx|xls|pdf|png|jpg|jpeg|tif|tiff|bmp|webp)$/i.test(name)) {
+    log('пропущен (неподдерживаемый тип): ' + name, 'err');
+    return;
+  }
   if (queue.length >= MAX){ log('лимит ' + MAX + ' файлов — «' + file.name + '» пропущен', 'err'); return; }
   try{
     const res = await fetch('/api/add?name=' + encodeURIComponent(file.name), { method:'POST', body:file });
     if (!res.ok){ const e = await res.json().catch(()=>({})); throw new Error(e.error||res.status); }
     const data = await res.json();
+    if (data.skipped) {
+      log('пропущен: ' + file.name + (data.reason ? ' — ' + data.reason : ''), 'err');
+      return;
+    }
     const item = {id:data.id, name:data.name, size:file.size, status:'queued'};
     queue.push(item); row(item);
     log('+ ' + item.name + '  (' + fmtSize(file.size) + ')', 'ok');

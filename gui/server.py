@@ -164,9 +164,8 @@ def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
     ext = os.path.splitext(name)[1].lower()
     enabled = set(D.CATEGORIES)
 
-    if ext in D.IMAGE_EXT:
-        raise D.SkipFile("формат не поддерживается (изображение/скан)")
-    if ext not in D.SUPPORTED_EXT:
+    # изображения обрабатывает doctorhide через Indra OCR
+    if ext not in D.SUPPORTED_EXT and ext not in D.IMAGE_EXT:
         raise D.SkipFile(f"формат не поддерживается ({ext or 'без расширения'})")
 
     if ext == ".pdf":
@@ -229,7 +228,7 @@ def _restore_queue() -> None:
         fid, name = fn.split("_", 1)
         if len(fid) != 12 or not name:
             continue
-        if os.path.splitext(name)[1].lower() not in D.SUPPORTED_EXT:
+        if os.path.splitext(name)[1].lower() not in D.SUPPORTED_EXT and os.path.splitext(name)[1].lower() not in D.IMAGE_EXT:
             continue
         with LOCK:
             if any(f["id"] == fid for f in FILES):
@@ -487,29 +486,17 @@ class Handler(BaseHTTPRequestHandler):
             dst = os.path.join(IN_DIR, f"{fid}_{name}")
             with open(dst, "wb") as f:
                 f.write(data)
-            ext = os.path.splitext(name)[1].lower()
-            if ext not in D.SUPPORTED_EXT:
+            ext = os.path.splitext(name.strip())[1].lower()
+            if ext not in D.SUPPORTED_EXT and ext not in D.IMAGE_EXT:
                 try:
                     os.remove(dst)
                 except OSError:
                     pass
-                self._json(200, {"id": fid, "name": name, "skipped": True})
+                log(f"пропущен {name}: расширение {ext or 'нет'}")
+                self._json(200, {"id": fid, "name": name, "skipped": True,
+                                 "reason": f"неподдерживаемый тип {ext or 'без расширения'}"})
                 return
-            if ext == ".pdf":
-                try:
-                    import pymupdf
-                    _d = pymupdf.open(dst)
-                    _txt = "".join(_p.get_text() for _p in _d)
-                    _d.close()
-                except Exception:
-                    _txt = ""
-                if len(_txt.strip()) < 40:
-                    try:
-                        os.remove(dst)
-                    except OSError:
-                        pass
-                    self._json(200, {"id": fid, "name": name, "skipped": True})
-                    return
+            # сканы PDF принимаем — OCR через Indra
             with LOCK:
                 FILES.append({"id": fid, "name": name, "orig": original, "path": dst,
                               "size": len(data), "ext": ext, "status": "queued", "out": None,
@@ -540,7 +527,7 @@ class Handler(BaseHTTPRequestHandler):
                 return
             original = name
             ext = os.path.splitext(original)[1].lower()
-            if ext not in D.SUPPORTED_EXT:
+            if ext not in D.SUPPORTED_EXT and ext not in D.IMAGE_EXT:
                 self._json(200, {"skipped": True})
                 return
             keep = bool(payload.get("keep_name"))
@@ -618,7 +605,10 @@ def main() -> int:
         print(f"Приложение уже запущено: http://{args.host}:{args.port}/ — "
               "второй экземпляр не нужен", flush=True)
         return 0
-    print(f"DoctorHide GUI: http://{args.host}:{args.port}/", flush=True)
+    url = f"http://{args.host}:{args.port}/"
+    print(f"DoctorHide GUI: {url}", flush=True)
+    import threading, webbrowser
+    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

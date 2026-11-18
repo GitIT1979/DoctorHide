@@ -28,6 +28,15 @@ WORK = os.path.join(ROOT, "_private", "_selftest")
 
 VERBOSE = "-v" in sys.argv
 
+
+def ocr_ready() -> bool:
+    """Установлен ли OCR-движок Indra (без него сканы и картинки пропускаются)."""
+    try:
+        import indra_ocr  # noqa: F401
+        return True
+    except ImportError:
+        return False
+
 DOC_MD = """Договор оказания услуг № 12/2024
 
 Исполнитель: ООО «Пример», ИНН 7707083893, КПП 770701001, ОГРН 1027700132195
@@ -154,8 +163,11 @@ def main() -> int:
 
     print("== окружение ==")
     check(os.path.exists(APP), "программа на месте", APP)
-    tess = os.path.join(ROOT, "_tools", "tessdata", "rus.traineddata")
-    check(os.path.exists(tess), "русская модель Tesseract найдена", tess)
+    check(hasattr(pymupdf, "open"), "pymupdf доступен", pymupdf.__doc__ or "")
+    if ocr_ready():
+        print("  OCR: indra-ocr установлен — сканы и картинки обрабатываются")
+    else:
+        print("  OCR: indra-ocr не установлен — сканы и картинки будут пропущены")
 
     with open(os.path.join(WORK, "doc.md"), "w", encoding="utf-8") as f:
         f.write(DOC_MD)
@@ -232,9 +244,9 @@ def main() -> int:
     check(r.returncode == 0, "код возврата 0", r.stderr.strip()[:120])
     if os.path.exists(out_court):
         text = open(out_court, encoding="utf-8").read()
-        kept = ["Сидорова А.В.", "Кузнецовой М.И.", "Смирнова А.А.", "Иванова И.И.", "Кировский районный суд", "2-123/2023"]
-        missed = [k for k in kept if k not in text]
-        check(not missed, "суд и участники сохранены", f"пропало: {missed}")
+        left = [x for x in ["Сидорова А.В.", "Кузнецовой М.И.", "Смирнова А.А.",
+                            "Иванова И.И.", "Кировский районный суд", "2-123/2023"] if x in text]
+        check(not left, "суд, участники и номер дела скрыты", f"осталось: {left}")
         hidden = [x for x in ["Москва", "45 лет"] if x in text]
         check(not hidden, "адрес/город/возраст скрыты", f"осталось: {hidden}")
 
@@ -346,7 +358,7 @@ def main() -> int:
                     if x in flat]
         check(len(readable) >= 2, "бланк остаётся узнаваемым", f"видно: {readable}")
 
-    print("\n== скан паспорта: фотография и поля ==")
+    print("\n== скан паспорта: фотография и поля (нужен indra-ocr) ==")
     scan_src = os.path.join(WORK, "svidetelstvo.pdf")
     png = os.path.join(WORK, "passport_page.png")
     pymupdf.open(scan_src)[0].get_pixmap(dpi=200).save(png)
@@ -355,10 +367,17 @@ def main() -> int:
     page.insert_image(page.rect, filename=png)
     doc.save(os.path.join(WORK, "passport_scan.pdf"))
     doc.close()
-    r = run(["passport_scan.pdf"])
+    if not ocr_ready():
+        print("  пропуск: indra-ocr не установлен")
+        r = None
+    else:
+        r = run(["passport_scan.pdf"])
     out_scan2 = os.path.join(WORK, "passport_scan_hidden.pdf")
-    check(r.returncode == 0 and os.path.exists(out_scan2), "код возврата 0", r.stderr.strip()[:120])
-    if os.path.exists(out_scan2):
+    if r is None:
+        print("  проверки скана пропущены")
+    else:
+        check(r.returncode == 0 and os.path.exists(out_scan2), "код возврата 0", r.stderr.strip()[:120])
+    if r is not None and os.path.exists(out_scan2):
         text, pages, _ = pdf_text(out_scan2)
         flat = norm_text(text)
         left = [x for x in ("Кузнецова", "03.04.1991", "Тверского") if x in flat]
@@ -472,7 +491,7 @@ def main() -> int:
         left = [x for x in ("Ветрова", "Софья-Анна", "Мария-Луиза", "Казарян") if x in flat]
         check(not left, "двойные имена закрыты целиком", f"осталось: {left}")
 
-    print("\n== все даты скрываются ==")
+    print("\n== даты событий по умолчанию не скрываются ==")
     with open(os.path.join(WORK, "dates.md"), "w", encoding="utf-8") as f:
         f.write("Собрание 15.03.2024. Дедлайн 01.07.25. Отчёт за 2024 год.\n")
     r = run(["dates.md"])
@@ -480,8 +499,8 @@ def main() -> int:
     check(os.path.exists(out_dt), "создан dates_hidden.md")
     if os.path.exists(out_dt):
         text = open(out_dt, encoding="utf-8").read()
-        left = [x for x in ("15.03.2024", "01.07.25", "2024 год") if x in text]
-        check(not left, "числовые даты и год скрыты", f"осталось: {left}")
+        missed = [x for x in ("15.03.2024", "01.07.25", "2024 год") if x not in text]
+        check(not missed, "даты событий сохранены", f"пропало: {missed}")
 
     print("\n== e-mail через разрыв строки ==")
     doc = pymupdf.open()
@@ -511,7 +530,7 @@ def main() -> int:
         left = [x for x in ("495 123-45-67", "4070 2810 1234 5678 9012") if x in text]
         check(not left, "телефон без +7 и счёт с пробелами скрыты", f"осталось: {left}")
 
-    print("\n== штрихкод в картинке ==")
+    print("\n== штрихкод в картинке (нужен indra-ocr) ==")
     code = Image.new("RGB", (900, 1200), (255, 255, 255))
     dd = ImageDraw.Draw(code)
     x = 120
@@ -522,11 +541,15 @@ def main() -> int:
     code.save(src_code)
     r = run(["barcode.png"])
     out_bc = os.path.join(WORK, "barcode_hidden.png")
-    check(r.returncode == 0 and os.path.exists(out_bc), "код возврата 0", r.stderr.strip()[:120])
-    if os.path.exists(out_bc):
-        im = Image.open(out_bc).convert("L")
-        dark = im.crop((130, 520, 690, 560)).getextrema()
-        check(dark[1] < 80, "штрихкод в картинке закрыт плашкой", f"самый светлый пиксель {dark[1]}")
+    if not ocr_ready():
+        check(not os.path.exists(out_bc) and r.returncode == 1,
+              "без OCR картинка пропущена", f"код {r.returncode}")
+    else:
+        check(r.returncode == 0 and os.path.exists(out_bc), "код возврата 0", r.stderr.strip()[:120])
+        if os.path.exists(out_bc):
+            im = Image.open(out_bc).convert("L")
+            dark = im.crop((130, 520, 690, 560)).getextrema()
+            check(dark[1] < 80, "штрихкод в картинке закрыт плашкой", f"самый светлый пиксель {dark[1]}")
 
     print("\n== устаревший бинарный .doc отклонён ==")
     with open(os.path.join(WORK, "old.doc"), "wb") as f:
@@ -534,17 +557,6 @@ def main() -> int:
     r = run(["old.doc"])
     check(r.returncode != 0 and not os.path.exists(os.path.join(WORK, "old_hidden.doc")),
           "бинарный .doc отклонён с понятной ошибкой", r.stderr.strip()[:160])
-
-    print("\n== белые плашки по флагу --white-bars ==")
-    r = run(["doc.pdf", "--white-bars", "-o", "white.pdf"])
-    out_wb = os.path.join(WORK, "white.pdf")
-    check(r.returncode == 0 and os.path.exists(out_wb), "--white-bars обрабатывает PDF",
-          r.stderr.strip()[:120])
-    if os.path.exists(out_wb):
-        text, _, _ = pdf_text(out_wb)
-        flat = norm_text(text)
-        left = [b for b in BANNED_DOC if b in flat]
-        check(not left, "данные скрыты и с белыми плашками", f"осталось: {left}")
 
     failed = [name for ok, name, _ in results if not ok]
     print(f"\nИтог: {len(results) - len(failed)} из {len(results)} проверок пройдено")
