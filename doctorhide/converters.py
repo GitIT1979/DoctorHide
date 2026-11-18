@@ -237,7 +237,7 @@ def legacy_office_to_text(path: str) -> str:
     try:
         with open(converted, "rb") as f:
             raw = f.read()
-        for enc in ("utf-8", "cp1251"):
+        for enc in ("utf-8-sig", "cp1251"):
             try:
                 return raw.decode(enc)
             except UnicodeDecodeError:

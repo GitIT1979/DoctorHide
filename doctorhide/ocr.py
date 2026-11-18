@@ -117,7 +117,7 @@ def ocr_pdf_pages(path: str) -> List[List[Line]]:
     for page in doc:
         pix = page.get_pixmap(dpi=_DPI, colorspace=pymupdf.csGRAY)
         gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
-        result = ocr(gray, turn=True)
+        result = ocr_page(gray)
         h, w = gray.shape[:2]
         pages.append(_page_to_lines(result, scale, page.rect.width, page.rect.height,
                                     rotation=result.rotation, img_w=w, img_h=h))
@@ -139,6 +139,27 @@ def _rotate_cw(gray, rotation: int):
     return gray
 
 
+def _mean_conf(page) -> float:
+    """Средняя уверенность распознавания страницы."""
+    vals = [ln.conf or 0.0 for ln in page.lines or []]
+    return sum(vals) / len(vals) if vals else 0.0
+
+
+def ocr_page(gray):
+    """OCR страницы без слепого доверия автоповороту.
+
+    Движок иногда «разворачивает» нормальную таблицу на 180° и возвращает
+    зеркальный текст (уверенность падает с ~0,96 до ~0,65). Сначала читаем
+    страницу как есть и берём автоповорот только если он заметно лучше.
+    """
+    ocr = _engine()
+    asis = ocr(gray, turn=False)
+    if _mean_conf(asis) >= 0.85:
+        return asis
+    turned = ocr(gray, turn=True)
+    return turned if _mean_conf(turned) > _mean_conf(asis) else asis
+
+
 def ocr_image_upright(path: str):
     """OCR изображения с выпрямлением: (строки, PNG-байты, ширина, высота).
 
@@ -150,7 +171,7 @@ def ocr_image_upright(path: str):
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         return [], None, 0, 0
-    result = ocr(img, turn=True)
+    result = ocr_page(img)
     up = _rotate_cw(img, result.rotation)
     h, w = up.shape[:2]
     lines = _page_to_lines(result, 1.0, float(w), float(h))
@@ -165,7 +186,7 @@ def ocr_image(path: str) -> List[Line]:
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         return []
-    result = ocr(img, turn=True)
+    result = ocr_page(img)
     h, w = img.shape[:2]
     # scale=1: координаты уже в пикселях; поворот возвращаем к исходной картинке
     return _page_to_lines(result, 1.0, float(w), float(h),
@@ -188,7 +209,7 @@ def ocr_pdf_with_tables(path: str):
     for page in doc:
         pix = page.get_pixmap(dpi=_DPI, colorspace=pymupdf.csGRAY)
         gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
-        result = ocr(gray, turn=True)
+        result = ocr_page(gray)
         h, w = gray.shape[:2]
         pages.append(_page_to_lines(result, scale, page.rect.width, page.rect.height,
                                     rotation=result.rotation, img_w=w, img_h=h))

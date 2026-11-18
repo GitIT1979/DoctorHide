@@ -159,6 +159,24 @@ def _pdf_text(src: str) -> str:
     return text
 
 
+def _convert_via_cli(src: str, dst_dir: str, name: str, out_ext: str, mode: str,
+                     enabled: set, timeout: int = 180) -> tuple[str, dict]:
+    """Обработка через CLI: для форматов, где нужен LibreOffice (.doc/.rtf)."""
+    dst = _unique(os.path.join(dst_dir, D.output_name(name, out_ext, enabled, mode)))
+    cmd = [sys.executable, os.path.join(ROOT, "doctorhide.py"), src, "-o", dst, "--keep-name"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False, text=True)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"обработка дольше {timeout} с — пропущен") from None
+    if not os.path.exists(dst):
+        err = (proc.stderr or proc.stdout or "").strip()
+        last = err.splitlines()[-1].strip() if err else "файл не обработан"
+        if "пропущен" in last:
+            raise D.SkipFile(last.split(":", 2)[-1].strip() or last)
+        raise RuntimeError(last[:300])
+    return dst, {"mode": mode, "boxes": 0, "photos": 0, "leftover": {}, "visible": {}}
+
+
 def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
     """Обрабатывает один файл: (путь результата, сводка)."""
     ext = os.path.splitext(name)[1].lower()
@@ -169,20 +187,38 @@ def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
         raise D.SkipFile(f"формат не поддерживается ({ext or 'без расширения'})")
 
     if ext == ".pdf":
-        mode = "judicial" if D.is_court_act(_pdf_text(src)) else "document"
-        dst = _unique(os.path.join(dst_dir, D.output_name(name, ".pdf", enabled, mode)))
-        cmd = [sys.executable, os.path.join(ROOT, "doctorhide.py"), src, "-o", dst, "--keep-name"]
         try:
-            proc = subprocess.run(cmd, capture_output=True, timeout=120, check=False, text=True)
+            mode = "judicial" if D.is_court_act(_pdf_text(src)) else "document"
+        except Exception as err:  # noqa: BLE001 — битый файл или не PDF
+            raise D.SkipFile(f"не удалось открыть PDF: {type(err).__name__}") from err
+        dst = _unique(os.path.join(dst_dir, D.output_name(name, ".pdf", enabled, mode)))
+        cmd = [sys.executable, os.path.join(ROOT, "doctorhide.py"), src, "-o", dst,
+               "--keep-name", "--json"]
+        try:
+            proc = subprocess.run(cmd, capture_output=True, timeout=900, check=False, text=True)
         except subprocess.TimeoutExpired:
-            raise RuntimeError("PDF обрабатывался дольше 120 с — пропущен")
+            raise RuntimeError("PDF обрабатывался дольше 15 мин — пропущен") from None
         if not os.path.exists(dst):
-            err = (proc.stderr or proc.stdout or "").strip()
-            # doctorhide пишет SkipFile в stderr как «пропущен …: pdf без текстового слоя»
-            if "без текстового слоя" in err or "пропущен" in err:
-                raise D.SkipFile("pdf без текстового слоя")
-            raise RuntimeError(err or "PDF не обработан")
+            reason = "PDF не обработан"
+            recs = []
+            try:
+                recs = json.loads((proc.stdout or "").strip() or "[]")
+            except json.JSONDecodeError:
+                recs = []
+            if recs:
+                reason = recs[0].get("reason") or reason
+                if recs[0].get("status") == "skipped":
+                    raise D.SkipFile(reason)
+            else:
+                err = (proc.stderr or proc.stdout or "").strip()
+                if err:
+                    reason = err.splitlines()[-1].strip()[:300]
+            raise RuntimeError(reason)
         return dst, {"mode": mode, "boxes": 0, "photos": 0, "leftover": {}, "visible": {}}
+
+    # .doc/.rtf — бинарные форматы: только через LibreOffice, поэтому через CLI
+    if ext in (".doc", ".rtf"):
+        return _convert_via_cli(src, dst_dir, name, ".md", "document", enabled)
 
     if ext in (".docx", ".doc"):
         md = D.docx_to_md(src)

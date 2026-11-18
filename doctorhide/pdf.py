@@ -128,11 +128,57 @@ def _apply_bars(page, rects: List[Rect], pymupdf, *, scan: bool = False) -> None
     page.apply_redactions(images=img_mode)
 
 
+def _redact_scan(path: str, dst: str, enabled: set, mode: str, pymupdf) -> Dict[str, int]:
+    """Скан без текстового слоя: страницы пересобираются выпрямленными.
+
+    Так работает и для сканов, положенных набок, и для страниц с /Rotate:
+    отрисованная страница OCR-ится как есть, при необходимости поворачивается
+    в нормальную ориентацию и плашки рисуются прямо в пикселях.
+    """
+    import cv2
+    import numpy as np
+
+    from .ocr import _DPI, _engine, _page_to_lines, _rotate_cw, ocr_page
+
+    src = pymupdf.open(path)
+    out = pymupdf.open()
+    stats: Dict[str, int] = {}
+    scale = _DPI / 72.0
+    for page in src:
+        pix = page.get_pixmap(dpi=_DPI, colorspace=pymupdf.csGRAY)
+        gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width).copy()
+        result = ocr_page(gray)
+        upright = _rotate_cw(gray, result.rotation)
+        h, w = upright.shape[:2]
+        lines = _page_to_lines(result, 1.0, float(w), float(h))
+        hits, page_stats = find_hits(lines, enabled, mode, aggressive_finance=True)
+        for cat, n in page_stats.items():
+            stats[cat] = stats.get(cat, 0) + n
+        for b in bars([r for r, _ in hits]):
+            cv2.rectangle(
+                upright,
+                (max(0, int(b.x0) - 2), max(0, int(b.y0) - 2)),
+                (min(w - 1, int(b.x1) + 2), min(h - 1, int(b.y1) + 2)),
+                0, -1,
+            )
+        ok, buf = cv2.imencode(".jpg", upright, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+        new_page = out.new_page(width=w / scale, height=h / scale)
+        new_page.insert_image(new_page.rect, stream=buf.tobytes())
+    out.set_metadata({})
+    out.save(dst, garbage=4, deflate=True)
+    out.close()
+    src.close()
+    return stats
+
+
 def redact_pdf(path: str, dst: str, enabled: set, mode: str) -> Dict[str, int]:
     """PDF: чёрные полосы. Сканы без текстового слоя — через Indra OCR."""
     pymupdf = _pymupdf()
-    doc = pymupdf.open(path)
-    full = "".join(p.get_text() for p in doc).strip()
+    try:
+        doc = pymupdf.open(path)
+        full = "".join(p.get_text() for p in doc).strip()
+    except Exception as err:  # noqa: BLE001 — битый файл, не PDF, шифрован
+        raise SkipFile(f"не удалось открыть PDF: {type(err).__name__}") from err
     # Скан — это картинка во всю страницу; короткий текст без картинок — обычный PDF
     # (иначе однострочный текстовый PDF уходил в «скан» и пропускался).
     is_scan = len(full) < 40 and any(p.get_images(full=True) for p in doc)
@@ -140,20 +186,10 @@ def redact_pdf(path: str, dst: str, enabled: set, mode: str) -> Dict[str, int]:
     ocr_tables = None
     ocr_rotations = None
     if is_scan:
+        doc.close()
         if not ocr_available():
-            doc.close()
             raise SkipFile("pdf без текстового слоя (установите indra-ocr)")
-        ocr_pages, ocr_tables, ocr_rotations = ocr_pdf_with_tables(path)
-        turned = [i + 1 for i, p in enumerate(doc)
-                  if p.rotation or (ocr_rotations and ocr_rotations[i])]
-        if turned:
-            # Плашки в повёрнутой системе координат пока не поддерживаются:
-            # лучше пропустить файл, чем отдать полу-обезличенный скан.
-            doc.close()
-            raise SkipFile(
-                "скан повёрнут (стр. %s) — поверните страницы и повторите"
-                % ", ".join(map(str, turned))
-            )
+        return _redact_scan(path, dst, enabled, mode, pymupdf)
     stats: Dict[str, int] = {}
     for i, page in enumerate(doc):
         extra = None

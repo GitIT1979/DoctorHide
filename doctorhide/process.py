@@ -195,9 +195,12 @@ def process(path: str, args, enabled: Optional[set] = None):
     if ext == ".pdf":
         enabled = set(enabled) if enabled is not None else default_enabled("document", args)
         import pymupdf
-        doc = pymupdf.open(path)
-        full = "".join(p.get_text() for p in doc).strip()
-        doc.close()
+        try:
+            doc = pymupdf.open(path)
+            full = "".join(p.get_text() for p in doc).strip()
+            doc.close()
+        except Exception as err:  # noqa: BLE001 — битый файл, не PDF, шифрован
+            raise SkipFile(f"не удалось открыть PDF: {type(err).__name__}") from err
         # сканы обрабатывает redact_pdf через Indra OCR
         if mode == "auto":
             mode = "judicial" if is_court_act(full) else "document"
