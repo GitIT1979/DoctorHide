@@ -591,6 +591,30 @@ class Handler(BaseHTTPRequestHandler):
         self.send_error(404, "not found")
 
 
+class _Server(ThreadingHTTPServer):
+    """Один сервер на порт.
+
+    Без SO_REUSEADDR: на Windows с ним каждый повторный запуск добавляет ещё
+    один слушатель на тот же порт, и соединения рвутся случайным образом
+    (зависшие экземпляры копились месяцами).
+    """
+
+    allow_reuse_address = False
+    daemon_threads = True
+
+
+def _already_running(host: str, port: int, timeout: float = 3.0) -> bool:
+    """Отвечает ли на порту именно DoctorHide."""
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(f"http://{host}:{port}/", timeout=timeout) as resp:
+            body = resp.read(4096).decode("utf-8", "replace")
+        return "DOCTORHIDE" in body.upper()
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="DoctorHide GUI")
     ap.add_argument("--port", type=int, default=8765)
@@ -600,10 +624,14 @@ def main() -> int:
     _reset_dirs(wipe=False)
     _restore_queue()
     try:
-        httpd = ThreadingHTTPServer((args.host, args.port), Handler)
+        httpd = _Server((args.host, args.port), Handler)
     except OSError:
-        print(f"Приложение уже запущено: http://{args.host}:{args.port}/ — "
-              "второй экземпляр не нужен", flush=True)
+        if _already_running(args.host, args.port):
+            print(f"Приложение уже запущено: http://{args.host}:{args.port}/ — "
+                  "второй экземпляр не нужен", flush=True)
+        else:
+            print(f"Порт {args.port} занят другим процессом — "
+                  f"запустите с --port {args.port + 1}", flush=True)
         return 0
     url = f"http://{args.host}:{args.port}/"
     print(f"DoctorHide GUI: {url}", flush=True)
