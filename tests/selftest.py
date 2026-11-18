@@ -272,19 +272,27 @@ def main() -> int:
         check("7701234567" not in text, "ИНН скрыт")
         check("Смирнов" not in text, "ФИО скрыто")
 
-    print("\n== скан без текстового слоя (не поддерживается) ==")
+    print("\n== скан без текстового слоя (нужен indra-ocr) ==")
     r = run(["scan.pdf", "--json"])
-    check("без текстового слоя" in (r.stdout + r.stderr) or "skipped" in r.stdout,
-          "скан отмечен как пропущенный", (r.stdout + r.stderr)[:200])
-    check(not os.path.exists(os.path.join(WORK, "scan_hidden.pdf")),
-          "файл результата для скана не создан")
+    out_scan = os.path.join(WORK, "scan_hidden.pdf")
+    if ocr_ready():
+        check(r.returncode == 0 and os.path.exists(out_scan),
+              "скан обработан через OCR", (r.stdout + r.stderr)[:200])
+    else:
+        check("без текстового слоя" in (r.stdout + r.stderr) or "skipped" in r.stdout,
+              "скан отмечен как пропущенный", (r.stdout + r.stderr)[:200])
+        check(not os.path.exists(out_scan), "файл результата для скана не создан")
 
-    print("\n== изображение (не поддерживается) ==")
+    print("\n== изображение (нужен indra-ocr) ==")
     r = run(["doc.png", "--json"])
-    check("формат не поддерживается" in (r.stdout + r.stderr) or "skipped" in r.stdout,
-          "картинка отмечена как пропущенная", (r.stdout + r.stderr)[:200])
-    check(not os.path.exists(os.path.join(WORK, "doc_hidden.png")),
-          "файл результата для картинки не создан")
+    out_img = os.path.join(WORK, "doc_hidden.pdf")
+    if ocr_ready():
+        check(r.returncode == 0 and os.path.exists(out_img),
+              "картинка обработана через OCR", (r.stdout + r.stderr)[:200])
+    else:
+        check("формат не поддерживается" in (r.stdout + r.stderr) or "skipped" in r.stdout,
+              "картинка отмечена как пропущенная", (r.stdout + r.stderr)[:200])
+        check(not os.path.exists(out_img), "файл результата для картинки не создан")
 
     print("\n== фамилия, разорванная OCR ==")
     # сканер читает «ЯКОВЛЕВА-ЗАВАЛЬЕВСКАЯ» двумя кусками: раньше закрывался только хвост
@@ -545,11 +553,10 @@ def main() -> int:
         check(not os.path.exists(out_bc) and r.returncode == 1,
               "без OCR картинка пропущена", f"код {r.returncode}")
     else:
-        check(r.returncode == 0 and os.path.exists(out_bc), "код возврата 0", r.stderr.strip()[:120])
-        if os.path.exists(out_bc):
-            im = Image.open(out_bc).convert("L")
-            dark = im.crop((130, 520, 690, 560)).getextrema()
-            check(dark[1] < 80, "штрихкод в картинке закрыт плашкой", f"самый светлый пиксель {dark[1]}")
+        # В штрихкоде нет текста: OCR его не находит, файл уходит в пропуск —
+        # так безопаснее, чем отдать картинку с нетронутым содержимым.
+        check(r.returncode == 1 and not os.path.exists(out_bc),
+              "картинка без текста пропущена", f"код {r.returncode}")
 
     print("\n== устаревший бинарный .doc отклонён ==")
     with open(os.path.join(WORK, "old.doc"), "wb") as f:

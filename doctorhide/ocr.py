@@ -55,14 +55,37 @@ def _split_words(text: str, x0: float, x1: float, y0: float, y1: float) -> List[
     return words
 
 
-def _page_to_lines(page, scale: float, page_w: float, page_h: float) -> List[Line]:
+def _unrotate(box, rotation: int, width: int, height: int):
+    """Координаты выпрямленного изображения -> координаты исходного.
+
+    Движок поворачивает картинку по часовой стрелке на `rotation` градусов;
+    плашки нужно вернуть туда, где текст лежит на исходной странице.
+    width/height — размеры ИСХОДНОГО изображения.
+    """
+    r = int(rotation or 0) % 360
+    x0, y0, x1, y1 = box
+    if r == 90:
+        pts = [(y, height - x) for x, y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1))]
+    elif r == 180:
+        pts = [(width - x, height - y) for x, y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1))]
+    elif r == 270:
+        pts = [(width - y, x) for x, y in ((x0, y0), (x1, y0), (x0, y1), (x1, y1))]
+    else:
+        return box
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    return min(xs), min(ys), max(xs), max(ys)
+
+
+def _page_to_lines(page, scale: float, page_w: float, page_h: float,
+                   rotation: int = 0, img_w: int = 0, img_h: int = 0) -> List[Line]:
     """Indra Page → наши Line. scale = пикселей на пункт PDF."""
     out: List[Line] = []
     for ln in page.lines or []:
         text = (ln.text or "").strip()
         if not text or (ln.conf or 0) < _MIN_CONF:
             continue
-        x0, y0, x1, y1 = ln.box
+        x0, y0, x1, y1 = _unrotate(ln.box, rotation, img_w, img_h)
         rx0 = max(0.0, x0 / scale)
         ry0 = max(0.0, y0 / scale)
         rx1 = min(page_w, x1 / scale)
@@ -95,13 +118,48 @@ def ocr_pdf_pages(path: str) -> List[List[Line]]:
         pix = page.get_pixmap(dpi=_DPI, colorspace=pymupdf.csGRAY)
         gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
         result = ocr(gray, turn=True)
-        pages.append(_page_to_lines(result, scale, page.rect.width, page.rect.height))
+        h, w = gray.shape[:2]
+        pages.append(_page_to_lines(result, scale, page.rect.width, page.rect.height,
+                                    rotation=result.rotation, img_w=w, img_h=h))
     doc.close()
     return pages
 
 
+def _rotate_cw(gray, rotation: int):
+    """Поворачивает изображение по часовой стрелке (как это делает движок OCR)."""
+    import cv2
+
+    r = int(rotation or 0) % 360
+    if r == 90:
+        return cv2.rotate(gray, cv2.ROTATE_90_CLOCKWISE)
+    if r == 180:
+        return cv2.rotate(gray, cv2.ROTATE_180)
+    if r == 270:
+        return cv2.rotate(gray, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return gray
+
+
+def ocr_image_upright(path: str):
+    """OCR изображения с выпрямлением: (строки, PNG-байты, ширина, высота).
+
+    Координаты строк — в пикселях уже выпрямленной картинки.
+    """
+    import cv2
+
+    ocr = _engine()
+    img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+    if img is None:
+        return [], None, 0, 0
+    result = ocr(img, turn=True)
+    up = _rotate_cw(img, result.rotation)
+    h, w = up.shape[:2]
+    lines = _page_to_lines(result, 1.0, float(w), float(h))
+    ok, buf = cv2.imencode(".png", up)
+    return lines, (buf.tobytes() if ok else None), w, h
+
+
 def ocr_image(path: str) -> List[Line]:
-    """OCR изображения. Координаты в пикселях изображения."""
+    """OCR изображения. Координаты в пикселях исходного изображения."""
     import cv2
     ocr = _engine()
     img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
@@ -109,14 +167,15 @@ def ocr_image(path: str) -> List[Line]:
         return []
     result = ocr(img, turn=True)
     h, w = img.shape[:2]
-    # scale=1: координаты уже в пикселях
-    return _page_to_lines(result, 1.0, float(w), float(h))
+    # scale=1: координаты уже в пикселях; поворот возвращаем к исходной картинке
+    return _page_to_lines(result, 1.0, float(w), float(h),
+                          rotation=result.rotation, img_w=w, img_h=h)
 
 
 def ocr_pdf_with_tables(path: str):
-    """OCR PDF: строки и прямоугольники таблиц (в пунктах PDF).
+    """OCR PDF: строки, прямоугольники таблиц и поворот каждой страницы.
 
-    Возвращает (pages_lines, table_rects_per_page).
+    Возвращает (pages_lines, table_rects_per_page, rotations).
     """
     import pymupdf
     import numpy as np
@@ -124,20 +183,24 @@ def ocr_pdf_with_tables(path: str):
     doc = pymupdf.open(path)
     pages: List[List[Line]] = []
     tables: List[List[Rect]] = []
+    rotations: List[int] = []
     scale = _DPI / 72.0
     for page in doc:
         pix = page.get_pixmap(dpi=_DPI, colorspace=pymupdf.csGRAY)
         gray = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.width)
         result = ocr(gray, turn=True)
-        pages.append(_page_to_lines(result, scale, page.rect.width, page.rect.height))
+        h, w = gray.shape[:2]
+        pages.append(_page_to_lines(result, scale, page.rect.width, page.rect.height,
+                                    rotation=result.rotation, img_w=w, img_h=h))
         trects = []
         for b in result.blocks or []:
             if b.get("label") == "Table":
-                x0, y0, x1, y1 = b["bbox"]
+                x0, y0, x1, y1 = _unrotate(b["bbox"], result.rotation, w, h)
                 trects.append(Rect(
                     max(0.0, x0 / scale), max(0.0, y0 / scale),
                     min(page.rect.width, x1 / scale), min(page.rect.height, y1 / scale),
                 ))
         tables.append(trects)
+        rotations.append(int(result.rotation or 0) % 360)
     doc.close()
-    return pages, tables
+    return pages, tables, rotations

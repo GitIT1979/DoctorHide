@@ -141,11 +141,11 @@ def default_enabled(mode: str, args) -> set:
 
 def _process_image(path: str, args, enabled):
     """Изображение: OCR Indra, PDF с плашками."""
-    from .ocr import ocr_image, available as ocr_available
+    from .ocr import ocr_image_upright, available as ocr_available
     if not ocr_available():
         raise SkipFile("изображение: установите indra-ocr")
     enabled = set(enabled) if enabled is not None else default_enabled("document", args)
-    lines = ocr_image(path)
+    lines, png, w, h = ocr_image_upright(path)
     if not lines:
         raise SkipFile("OCR не нашёл текст")
     mode = args.mode
@@ -156,14 +156,14 @@ def _process_image(path: str, args, enabled):
     from .detect import find_hits
     hits, stats = find_hits(lines, enabled, mode, aggressive_finance=True)
     import pymupdf
-    imgdoc = pymupdf.open(path)
-    # страница размером с изображение
-    pix = imgdoc[0].get_pixmap()
-    w, h = pix.width, pix.height
+    # Страницу строим по выпрямленной картинке: у повёрнутого скана координаты
+    # OCR иначе не совпадают с исходным изображением.
     doc = pymupdf.open()
     page = doc.new_page(width=w, height=h)
-    page.insert_image(pymupdf.Rect(0, 0, w, h), filename=path)
-    imgdoc.close()
+    if png:
+        page.insert_image(pymupdf.Rect(0, 0, w, h), stream=png)
+    else:
+        page.insert_image(pymupdf.Rect(0, 0, w, h), filename=path)
     if hits:
         for r, _cat in hits:
             page.add_redact_annot(pymupdf.Rect(r.x0, r.y0, r.x1, r.y1), fill=(0, 0, 0))
@@ -172,7 +172,7 @@ def _process_image(path: str, args, enabled):
     if not dst.lower().endswith(".pdf"):
         dst = os.path.splitext(dst)[0] + ".pdf"
     doc.set_metadata({})
-    doc.save(dst)
+    doc.save(dst, deflate=True)
     doc.close()
     config.CURRENT["enabled"], config.CURRENT["mode"] = enabled, mode
     return {"file": os.path.basename(path), "status": "ok", "mode": mode,

@@ -20,14 +20,18 @@ def _pymupdf():
 
 def _transform_rect(rect: Rect, matrix) -> Rect:
     """Применяет matrix к четырём углам Rect, возвращает axis-aligned bbox."""
+    import pymupdf
+
+    # В PyMuPDF 2.0 точку преобразует только `point * matrix` (обратный порядок
+    # бросает ValueError: Matrix: bad seq len).
     pts = [
-        matrix * (rect.x0, rect.y0),
-        matrix * (rect.x1, rect.y0),
-        matrix * (rect.x0, rect.y1),
-        matrix * (rect.x1, rect.y1),
+        pymupdf.Point(rect.x0, rect.y0) * matrix,
+        pymupdf.Point(rect.x1, rect.y0) * matrix,
+        pymupdf.Point(rect.x0, rect.y1) * matrix,
+        pymupdf.Point(rect.x1, rect.y1) * matrix,
     ]
-    xs = [p.x if hasattr(p, "x") else p[0] for p in pts]
-    ys = [p.y if hasattr(p, "y") else p[1] for p in pts]
+    xs = [p.x for p in pts]
+    ys = [p.y for p in pts]
     return Rect(min(xs), min(ys), max(xs), max(ys))
 
 
@@ -134,11 +138,22 @@ def redact_pdf(path: str, dst: str, enabled: set, mode: str) -> Dict[str, int]:
     is_scan = len(full) < 40 and any(p.get_images(full=True) for p in doc)
     ocr_pages = None
     ocr_tables = None
+    ocr_rotations = None
     if is_scan:
         if not ocr_available():
             doc.close()
             raise SkipFile("pdf без текстового слоя (установите indra-ocr)")
-        ocr_pages, ocr_tables = ocr_pdf_with_tables(path)
+        ocr_pages, ocr_tables, ocr_rotations = ocr_pdf_with_tables(path)
+        turned = [i + 1 for i, p in enumerate(doc)
+                  if p.rotation or (ocr_rotations and ocr_rotations[i])]
+        if turned:
+            # Плашки в повёрнутой системе координат пока не поддерживаются:
+            # лучше пропустить файл, чем отдать полу-обезличенный скан.
+            doc.close()
+            raise SkipFile(
+                "скан повёрнут (стр. %s) — поверните страницы и повторите"
+                % ", ".join(map(str, turned))
+            )
     stats: Dict[str, int] = {}
     for i, page in enumerate(doc):
         extra = None
@@ -162,6 +177,10 @@ def redact_pdf(path: str, dst: str, enabled: set, mode: str) -> Dict[str, int]:
         hits, page_stats = find_hits(
             lines, enabled, mode, aggressive_finance=True, extra_tables=extra
         )
+        # pdf_lines отдаёт координаты видимой (повёрнутой) страницы, а плашки
+        # ставятся в неповёрнутой системе координат PDF.
+        if not is_scan and page.rotation:
+            hits = [(_transform_rect(r, page.derotation_matrix), cat) for r, cat in hits]
         if not hits:
             continue
         for cat, n in page_stats.items():
