@@ -1,6 +1,6 @@
 # DoctorHide
 
-Обезличивание документов: **PDF с текстовым слоем**, DOCX, DOC, RTF, XLSX, MD/TXT.
+Обезличивание документов: **PDF с текстовым слоем**, DOCX, DOC, RTF, XLSX, XLS, MD/TXT.
 
 Персональные данные закрываются **чёрными** плашками. В PDF скрытый текст физически
 удаляется, вставленные изображения под плашкой тоже удаляются — остальной документ
@@ -8,7 +8,8 @@
 
 Картинки и PDF-сканы (без текстового слоя) обрабатываются только при установленном
 `indra-ocr`; без него файл → `skipped` с понятной причиной.
-Форматы **.doc / .rtf** конвертируются через LibreOffice в текст (или DOCX при `--keep-format`).
+Форматы **.doc / .rtf / .xls** конвертируются через LibreOffice во временный
+DOCX/текст/XLSX (LibreOffice ищется в PATH и в стандартных местах установки).
 
 ## Что скрывается
 
@@ -44,7 +45,8 @@ python -m pip install -r requirements.txt
 ```
 
 Требуется Python 3.9+.
-Для **.doc / .rtf** — LibreOffice (`soffice`) в PATH.
+Для **.doc / .rtf / .xls** — LibreOffice (`soffice`); достаточно установить его —
+PATH не обязателен, берётся и `C:\Program Files\LibreOffice\program\soffice.exe`.
 Для PDF — пакет `pymupdf`.
 
 ## Использование
@@ -58,6 +60,7 @@ python doctorhide.py "решение.pdf" --mode judicial
 python doctorhide.py "папка/" --report report.json
 python doctorhide.py "акт.docx" --keep-format   # результат .docx с [censored]
 python doctorhide.py "старый.doc"               # DOC/RTF → через LibreOffice → .md
+python doctorhide.py "расчет.xls"               # XLS → через LibreOffice → .md
 ```
 
 Выбор категорий:
@@ -99,6 +102,9 @@ python doctorhide.py in/ --report report.json --json
   в область найденных данных, изображение остаётся.
 - Сканы PDF с поворотом страницы (`/Rotate`) пока пропускаются с подсказкой:
   плашки в повёрнутой системе координат ещё не поддерживаются.
+- **.xls / .doc / .rtf** требуют LibreOffice: он ищется в PATH и в стандартных папках
+  установки; без него файл → `skipped` с причиной. Битый файл, который LibreOffice
+  конвертирует в мусор, тоже помечается пропущенным, а не выдаётся пустым.
 - Картинки (PNG/JPG/TIFF) обрабатываются в любой ориентации: страница выпрямляется,
   результат — PDF с чёрными плашками.
 - PDF только с текстовым слоем; сканы и изображения не обрабатываются.

@@ -37,6 +37,21 @@ def ocr_ready() -> bool:
     except ImportError:
         return False
 
+
+def soffice_path():
+    """LibreOffice: из PATH или из обычного места установки."""
+    import shutil
+
+    exe = shutil.which("soffice") or shutil.which("libreoffice")
+    if exe:
+        return exe
+    for path in (r"C:\Program Files\LibreOffice\program\soffice.exe",
+                 r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+                 "/Applications/LibreOffice.app/Contents/MacOS/soffice"):
+        if os.path.isfile(path):
+            return path
+    return None
+
 DOC_MD = """Договор оказания услуг № 12/2024
 
 Исполнитель: ООО «Пример», ИНН 7707083893, КПП 770701001, ОГРН 1027700132195
@@ -557,6 +572,34 @@ def main() -> int:
         # так безопаснее, чем отдать картинку с нетронутым содержимым.
         check(r.returncode == 1 and not os.path.exists(out_bc),
               "картинка без текста пропущена", f"код {r.returncode}")
+
+    print("\n== старый .xls (через LibreOffice) ==")
+    soffice = soffice_path()
+    if not soffice:
+        print("  пропуск: LibreOffice не найден")
+    else:
+        import openpyxl
+
+        xlsx = os.path.join(WORK, "peni.xlsx")
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.append(["Должник", "ИНН", "Сумма пени, руб."])
+        ws.append(["Иванов Иван Иванович", "7707083893", "1234.56"])
+        wb.save(xlsx)
+        subprocess.run([soffice, "--headless", "--nologo", "--nolockcheck",
+                        "--convert-to", "xls", "--outdir", WORK, xlsx],
+                       capture_output=True, text=True, timeout=120)
+        xls = os.path.join(WORK, "peni.xls")
+        check(os.path.exists(xls), "тестовый .xls собран")
+        if os.path.exists(xls):
+            r = run(["peni.xls"])
+            out_xls = os.path.join(WORK, "peni_hidden.md")
+            check(r.returncode == 0 and os.path.exists(out_xls),
+                  "код возврата 0 и результат есть", r.stderr.strip()[:160])
+            if os.path.exists(out_xls):
+                text = open(out_xls, encoding="utf-8").read()
+                left = [x for x in ("7707083893", "Иванов Иван Иванович") if x in text]
+                check(not left, "ПДн из .xls скрыты", f"осталось: {left}")
 
     print("\n== устаревший бинарный .doc отклонён ==")
     with open(os.path.join(WORK, "old.doc"), "wb") as f:

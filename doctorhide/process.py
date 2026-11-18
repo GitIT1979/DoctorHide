@@ -222,6 +222,12 @@ def process(path: str, args, enabled: Optional[set] = None):
                 ext = ".docx"
             else:
                 raw = legacy_office_to_text(path)
+                # Битый .doc LibreOffice «конвертирует» в мусор из байтов:
+                # настоящий документ всегда содержит слово из 3+ букв.
+                if not raw.strip() or not re.search(r"[A-Za-zА-Яа-яЁё]{3,}", raw):
+                    raise SkipFile(
+                        "LibreOffice вернул не текст — файл повреждён или пуст"
+                    )
                 if mode == "auto":
                     mode = "judicial" if is_court_act(raw) else "document"
                 enabled = set(enabled) if enabled is not None else default_enabled(mode, args)
@@ -297,6 +303,8 @@ def process(path: str, args, enabled: Optional[set] = None):
         out_ext = ".md"
     elif ext in SHEET_EXT:
         raw = sheet_to_md(path)
+        if not raw.strip():
+            raise SkipFile("в таблице нет данных")
         rows, heads = [], {}
         for line in raw.split("\n"):
             if line.startswith("|") and not re.search(r"\d", line):

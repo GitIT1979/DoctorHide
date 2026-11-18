@@ -3,10 +3,76 @@
 
 from __future__ import annotations
 
+import contextlib
+import os
 import re
+import shutil
 from typing import Dict, List, Tuple
 
 from .anonymize import anonymize_text
+from .config import SkipFile
+
+
+def _find_soffice():
+    """soffice из PATH или из обычных мест установки (Windows, macOS, Linux)."""
+    exe = shutil.which("soffice") or shutil.which("libreoffice")
+    if exe:
+        return exe
+    for path in (
+        r"C:\Program Files\LibreOffice\program\soffice.exe",
+        r"C:\Program Files (x86)\LibreOffice\program\soffice.exe",
+        "/Applications/LibreOffice.app/Contents/MacOS/soffice",
+        "/usr/lib/libreoffice/program/soffice",
+        "/usr/bin/soffice",
+    ):
+        if os.path.isfile(path):
+            return path
+    return None
+
+
+def _soffice_convert(path: str, target: str, timeout: int = 120) -> str:
+    """Конвертирует файл через LibreOffice; результат — во временной папке.
+
+    Удалять временную папку — забота вызывающего (os.path.dirname результата).
+    """
+    import subprocess
+    import tempfile
+
+    soffice = _find_soffice()
+    if not soffice:
+        raise RuntimeError(
+            "нужен LibreOffice (soffice) — установите его или добавьте в PATH"
+        )
+    tmp = tempfile.mkdtemp()
+    proc = subprocess.run(
+        [soffice, "--headless", "--nologo", "--nolockcheck",
+         "--convert-to", target, "--outdir", tmp, path],
+        capture_output=True, text=True, timeout=timeout,
+    )
+    ext = "." + target.split(":")[0].strip().lower()
+    found = [f for f in os.listdir(tmp) if f.lower().endswith(ext)]
+    if not found:
+        err = (proc.stderr or proc.stdout or "").strip() or "unknown error"
+        raise RuntimeError(
+            f"LibreOffice не сконвертировал {os.path.splitext(path)[1]} в {target}: {err}"
+        )
+    return os.path.join(tmp, found[0])
+
+
+@contextlib.contextmanager
+def _sheet_source(path: str):
+    """Для старого .xls подставляет сконвертированный .xlsx (openpyxl его не читает)."""
+    if os.path.splitext(path)[1].lower() != ".xls":
+        yield path
+        return
+    try:
+        converted = _soffice_convert(path, "xlsx")
+    except RuntimeError as err:
+        raise SkipFile(str(err)) from err
+    try:
+        yield converted
+    finally:
+        shutil.rmtree(os.path.dirname(converted), ignore_errors=True)
 
 
 def docx_to_md(path: str) -> str:
@@ -53,7 +119,8 @@ def sheet_to_md(path: str) -> str:
     """Таблица -> Markdown: листы как разделы, строки как строки таблицы."""
     import openpyxl
 
-    wb = openpyxl.load_workbook(path, data_only=True)
+    with _sheet_source(path) as src:
+        wb = openpyxl.load_workbook(src, data_only=True)
     out: List[str] = []
     for ws in wb.worksheets:
         rows = [["" if c is None else str(c) for c in r] for r in ws.iter_rows(values_only=True)]
@@ -128,10 +195,11 @@ def anonymize_docx(path: str, dst: str, mode: str, enabled: set) -> Dict[str, in
 
 
 def anonymize_xlsx(path: str, dst: str, mode: str, enabled: set) -> Dict[str, int]:
-    """Обезличивает строковые ячейки XLSX, сохраняя книгу и типы остальных ячеек."""
+    """Обезличивает строковые ячейки XLSX/XLS, сохраняя книгу и типы остальных ячеек."""
     import openpyxl
 
-    wb = openpyxl.load_workbook(path)
+    with _sheet_source(path) as src:
+        wb = openpyxl.load_workbook(src)
     stats: Dict[str, int] = {}
     for ws in wb.worksheets:
         for row in ws.iter_rows():
@@ -165,62 +233,31 @@ def anonymize_xlsx(path: str, dst: str, mode: str, enabled: set) -> Dict[str, in
 
 def legacy_office_to_text(path: str) -> str:
     """DOC / RTF → plain text через LibreOffice (soffice --headless)."""
-    import os
-    import shutil
-    import subprocess
-    import tempfile
-
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    if not soffice:
-        raise RuntimeError(
-            "для .doc/.rtf нужен LibreOffice (soffice) в PATH"
-        )
-    ext = os.path.splitext(path)[1].lower()
-    with tempfile.TemporaryDirectory() as td:
-        # txt filter
-        cmd = [
-            soffice, "--headless", "--nologo", "--nolockcheck",
-            "--convert-to", "txt:Text",
-            "--outdir", td,
-            path,
-        ]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-        base = os.path.splitext(os.path.basename(path))[0] + ".txt"
-        out = os.path.join(td, base)
-        if not os.path.isfile(out):
-            # иногда имя нормализуется
-            candidates = [f for f in os.listdir(td) if f.lower().endswith(".txt")]
-            if not candidates:
-                err = (r.stderr or r.stdout or "").strip() or "unknown error"
-                raise RuntimeError(f"LibreOffice не сконвертировал {ext}: {err}")
-            out = os.path.join(td, candidates[0])
-        with open(out, encoding="utf-8", errors="replace") as f:
-            return f.read()
+    converted = _soffice_convert(path, "txt:Text (encoded):UTF8")
+    try:
+        with open(converted, "rb") as f:
+            raw = f.read()
+        for enc in ("utf-8", "cp1251"):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode("utf-8", errors="replace")
+    finally:
+        shutil.rmtree(os.path.dirname(converted), ignore_errors=True)
 
 
 def legacy_office_to_docx(path: str) -> str:
     """DOC / RTF → временный DOCX (путь к файлу) через LibreOffice.
 
-    Вызывающий должен удалить файл после использования, если он во temp.
+    Вызывающий должен удалить папку файла после использования.
     """
-    import os
-    import shutil
-    import subprocess
-    import tempfile
+    return _soffice_convert(path, "docx")
 
-    soffice = shutil.which("soffice") or shutil.which("libreoffice")
-    if not soffice:
-        raise RuntimeError("для .doc/.rtf нужен LibreOffice (soffice) в PATH")
-    td = tempfile.mkdtemp()
-    cmd = [
-        soffice, "--headless", "--nologo", "--nolockcheck",
-        "--convert-to", "docx",
-        "--outdir", td,
-        path,
-    ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
-    candidates = [f for f in os.listdir(td) if f.lower().endswith(".docx")]
-    if not candidates:
-        err = (r.stderr or r.stdout or "").strip() or "unknown error"
-        raise RuntimeError(f"LibreOffice не сконвертировал в docx: {err}")
-    return os.path.join(td, candidates[0])
+
+def legacy_sheet_to_xlsx(path: str) -> str:
+    """Старый .xls → временный .xlsx через LibreOffice.
+
+    Вызывающий должен удалить папку файла после использования.
+    """
+    return _soffice_convert(path, "xlsx")
