@@ -258,6 +258,31 @@ RULES: List[Tuple[str, str, str, Optional[str], int]] = [
     ("org", "court_tretey", r"\b[А-ЯЁ][А-Яа-яЁё\-\s]{2,40}?(?:третейск\w+|миров\w+)\s+суд\w*", None, 0),
     ("org", "court_phrase", r"(?:спор\w*|дело)\s+[^\n]{0,40}?(?:рассматрива\w+|подлежит\s+рассмотрению)\s+в\s+[^\n,.]{2,60}", None, 0),
     ("docno", "long_number", r"\b\d{15,}\b", None, 0),
+    # --- EXIF / GPS (извлекается из изображений через metadata.extract_image_exif_text) ---
+    # GPS-координаты в формате EXIF-полей: "GPSLatitude: 55.755800 N"
+    ("address", "gps_coord",
+     r"\bGPS(?:Latitude|Longitude|Altitude|Position)[:\s]*[-+]?\d{1,3}(?:\.\d{1,6})?\s*[NSEWmn]?\b",
+     None, 0),
+    # Свободный формат: "55.7558 N", "37.6173 E" — 4+ знаков после точки + сторона света
+    ("address", "gps_free",
+     r"\b\d{1,3}\.\d{4,6}\s*[NSEW]\b",
+     None, 0),
+    # EXIF-даты: "2024:05:15 12:34:56", "GPSDateStamp: 2024:05:15"
+    ("docno", "exif_date",
+     r"\b(?:DateTimeOriginal|DateTimeDigitized|GPSDateStamp|GPSTimeStamp)[:\s]*"
+     r"\d{4}:\d{2}:\d{2}(?:\s+\d{2}:\d{2}:\d{2})?\b",
+     None, 0),
+    # EXIF-поля с ПДн: "Artist: Ivan Ivanov", "Copyright: (c) Ivanov",
+    # "BodySerialNumber: SN12345678", "UserComment: ..." — заменяем значение
+    # на placeholder (grp=1 = value), имя поля сохраняется.
+    ("address", "exif_field",
+     r"\b(?:GPS(?:Latitude|Longitude|Altitude|TimeStamp|DateStamp|Position|Dest|Info|Speed|Track|ImgDirection|AreaInformation)"
+     r"|DateTimeOriginal|DateTimeDigitized|Artist|Copyright|UserComment"
+     r"|XPTitle|XPAuthor|XPKeywords|XPSubject|XPComment|XPCompany"
+     r"|OwnerName|CameraOwnerName|BodySerialNumber|LensSerialNumber"
+     r"|ImageUniqueID|DocumentName)"
+     r":\s*([^\n]+)",
+     None, 1),
 ]
 
 BLOCK_RULES = {

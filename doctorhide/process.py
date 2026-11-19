@@ -140,24 +140,41 @@ def default_enabled(mode: str, args) -> set:
 
 
 def _process_image(path: str, args, enabled):
-    """Изображение: OCR Indra, PDF с плашками."""
+    """Изображение: OCR Indra, PDF с плашками.
+
+    EXIF-метаданные исходного изображения (GPS, даты, Artist, Copyright и др.)
+    извлекаются как текст и анонимизируются вместе с OCR-текстом. В выходной PDF
+    EXIF не попадает (PyMuPDF insert_image не переносит EXIF), но статистика
+    попадает в отчёт, чтобы пользователь видел, что было закрыто.
+    """
     from .ocr import ocr_image_upright, available as ocr_available
+    from .metadata import extract_image_exif_text, clear_pdf_metadata
     if not ocr_available():
         raise SkipFile("изображение: установите indra-ocr")
     enabled = set(enabled) if enabled is not None else default_enabled("document", args)
     lines, png, w, h = ocr_image_upright(path)
     if not lines:
         raise SkipFile("OCR не нашёл текст")
+    # EXIF-метаданные: извлекаем один раз, используем и для judicial-режима,
+    # и для статистики анонимизации.
+    exif_text = extract_image_exif_text(path)
     mode = args.mode
     if mode == "auto":
         raw = "\n".join(ln.text for ln in lines)
+        if exif_text:
+            raw = exif_text + "\n\n" + raw
         mode = "judicial" if is_court_act(raw) else "document"
         enabled = set(enabled) if getattr(args, "keep", None) or getattr(args, "only", None) else default_enabled(mode, args)
     from .detect import find_hits
     hits, stats = find_hits(lines, enabled, mode, aggressive_finance=True)
+    # Анонимизация EXIF-метаданных: координаты GPS, даты, Artist, Copyright
+    # и др. закрываются [censored] через правила gps_coord, exif_date, exif_field.
+    if exif_text:
+        from .anonymize import anonymize_text
+        _, exif_stats = anonymize_text(exif_text, mode, enabled)
+        for k, v in exif_stats.items():
+            stats[k] = stats.get(k, 0) + v
     import pymupdf
-    # Страницу строим по выпрямленной картинке: у повёрнутого скана координаты
-    # OCR иначе не совпадают с исходным изображением.
     doc = pymupdf.open()
     page = doc.new_page(width=w, height=h)
     if png:
@@ -171,7 +188,8 @@ def _process_image(path: str, args, enabled):
     dst = args.out or out_name(path, ".pdf")
     if not dst.lower().endswith(".pdf"):
         dst = os.path.splitext(dst)[0] + ".pdf"
-    doc.set_metadata({})
+    # Очистка метаданных PDF: doc.info + XMP + Information Dictionary.
+    clear_pdf_metadata(doc)
     doc.save(dst, deflate=True)
     doc.close()
     config.CURRENT["enabled"], config.CURRENT["mode"] = enabled, mode

@@ -165,6 +165,9 @@ def _redact_scan(path: str, dst: str, enabled: set, mode: str, pymupdf) -> Dict[
         new_page = out.new_page(width=w / scale, height=h / scale)
         new_page.insert_image(new_page.rect, stream=buf.tobytes())
     out.set_metadata({})
+    # Дополнительно: очистка XMP и Information Dictionary.
+    from .metadata import clear_pdf_metadata
+    clear_pdf_metadata(out)
     out.save(dst, garbage=4, deflate=True)
     out.close()
     src.close()
@@ -223,6 +226,9 @@ def redact_pdf(path: str, dst: str, enabled: set, mode: str) -> Dict[str, int]:
             stats[cat] = stats.get(cat, 0) + n
         _apply_bars(page, [r for r, _ in hits], pymupdf, scan=is_scan)
     doc.set_metadata({})
+    # Дополнительно: очистка XMP и Information Dictionary.
+    from .metadata import clear_pdf_metadata
+    clear_pdf_metadata(doc)
     doc.save(dst, garbage=4, deflate=True, clean=True)
     doc.close()
     return stats

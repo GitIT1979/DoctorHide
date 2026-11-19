@@ -29,6 +29,10 @@ from .pdf import pdf_lines, bars, redact_pdf
 from .process import (
     sanitize_filename, output_name, out_name, default_enabled, process,
 )
+from .metadata import (
+    clear_pdf_metadata, clear_office_metadata,
+    strip_image_exif, extract_image_exif_text,
+)
 from .cli import print_categories, ask_categories, main
 
 __all__ = [
@@ -49,6 +53,8 @@ __all__ = [
     "PLACEHOLDER", "SAFE_NAME", "KEEP_NAME", "KEEP_FORMAT", "NAME_COUNTER", "CURRENT",
     "BAR_RGB", "BAR_FILL", "TEXT_EXT", "SHEET_EXT", "DOC_EXT", "SUPPORTED_EXT", "IMAGE_EXT",
     "sanitize_filename", "output_name", "out_name", "default_enabled", "process",
+    "clear_pdf_metadata", "clear_office_metadata",
+    "strip_image_exif", "extract_image_exif_text",
     "print_categories", "ask_categories", "main",
 ]
 
