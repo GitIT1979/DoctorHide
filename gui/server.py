@@ -522,6 +522,25 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
 
+        # Статические файлы (gif, png, jpg, ico, css, js) из каталога gui/
+        if path.startswith("/") and not path.startswith("/api/"):
+            gui_dir = os.path.dirname(os.path.abspath(__file__))
+            static_path = os.path.join(gui_dir, path.lstrip("/"))
+            if os.path.isfile(static_path):
+                ext = os.path.splitext(path)[1].lower()
+                ct = {".gif": "image/gif", ".png": "image/png", ".jpg": "image/jpeg",
+                      ".jpeg": "image/jpeg", ".ico": "image/x-icon",
+                      ".css": "text/css", ".js": "application/javascript"}.get(ext)
+                if ct:
+                    data = open(static_path, "rb").read()
+                    self.send_response(200)
+                    self.send_header("Content-Type", ct)
+                    self.send_header("Content-Length", str(len(data)))
+                    self.send_header("Cache-Control", "public, max-age=3600")
+                    self.end_headers()
+                    self.wfile.write(data)
+                    return
+
         if path == "/api/status":
             with LOCK:
                 files = [dict(f) for f in FILES
