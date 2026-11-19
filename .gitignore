@@ -45,3 +45,6 @@ Thumbs.db
 .idea/
 .vscode/
 .coverage
+
+# Compiled binaries (use releases, not source tree)
+*.exe

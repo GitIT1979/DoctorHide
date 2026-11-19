@@ -20,7 +20,7 @@ _SENT_SPLIT = re.compile(r"(?<=[.!?…])\s+|\n+")
 
 # --- якоря «деньги / условные единицы» (B) ---
 _MONEY = re.compile(
-    r"(?:руб\w*|₽|usd|eur|евро|долл\w*|gbp|jpy|cny|cny|chf|try|kzt|byn|uah|"
+    r"(?:руб\w*|₽|usd|eur|евро|долл\w*|gbp|jpy|cny|chf|try|kzt|byn|uah|"
     r"тыс\.?|млн\w*|млрд\w*|у\.?\s*е\.?|\bуе\b|усл\.?\s*ед\w*|"
     r"экю|\becu\b|\bsdr\b|балл\w*|бонус\w*|крипт\w*|bitcoin|\bbtc\b|"
     r"\beth\w*\b|\busdt\b|\busdc\b|токен\w*|монет\w*|coins?\b|"

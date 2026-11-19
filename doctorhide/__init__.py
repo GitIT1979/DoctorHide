@@ -26,6 +26,7 @@ from .vertical_text import is_vertical_word, merge_vertical_words
 from .anonymize import anonymize_text
 from .converters import docx_to_md, sheet_to_md, anonymize_docx, anonymize_xlsx
 from .pdf import pdf_lines, bars, redact_pdf
+from .ocr import ocr_pdf_pages, ocr_pdf_with_tables, available as ocr_available
 from .process import (
     sanitize_filename, output_name, out_name, default_enabled, process,
 )
@@ -49,6 +50,7 @@ __all__ = [
     "is_vertical_word", "merge_vertical_words",
     "anonymize_text", "docx_to_md", "sheet_to_md", "anonymize_docx", "anonymize_xlsx",
     "pdf_lines", "bars", "redact_pdf",
+    "ocr_pdf_pages", "ocr_pdf_with_tables", "ocr_available",
     "SkipFile",
     "PLACEHOLDER", "SAFE_NAME", "KEEP_NAME", "KEEP_FORMAT", "NAME_COUNTER", "CURRENT",
     "BAR_RGB", "BAR_FILL", "TEXT_EXT", "SHEET_EXT", "DOC_EXT", "SUPPORTED_EXT", "IMAGE_EXT",

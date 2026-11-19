@@ -187,6 +187,12 @@ def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
     if ext not in D.SUPPORTED_EXT and ext not in D.IMAGE_EXT:
         raise D.SkipFile(f"формат не поддерживается ({ext or 'без расширения'})")
 
+    # Изображения — через CLI (process._process_image делает OCR + redaction + EXIF + metadata).
+    if ext in D.IMAGE_EXT:
+        if not D.ocr_available():
+            raise D.SkipFile("изображение; для OCR установите indra-ocr: pip install indra-ocr")
+        return _convert_via_cli(src, dst_dir, name, ".pdf", "document", enabled, timeout=300)
+
     if ext == ".pdf":
         try:
             mode = "judicial" if D.is_court_act(_pdf_text(src)) else "document"
@@ -690,6 +696,9 @@ class Handler(BaseHTTPRequestHandler):
                         f["error"] = None
                 RUNNING["value"] = True
                 RUNNING["stop"] = False  # сбрасываем флаг отмены перед новым прогоном
+                # Сброс счётчика выходных имён — иначе при повторных прогонах
+                # _claim() добавляет _2, _3 суффиксы из-за остатков в set.
+                D.config.CURRENT["outputs"] = set()
             threading.Thread(target=_worker, daemon=True).start()
             log(f"start: {len(queued)} файлов")
             self._json(200, {"started": len(queued)})
