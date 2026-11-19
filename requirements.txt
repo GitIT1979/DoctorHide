@@ -1,5 +1,6 @@
-pymupdf>=1.23
-python-docx>=0.8.11
-openpyxl>=3.1
+# Основные зависимости DoctorHide
+pymupdf>=1.23,<2.0
+python-docx>=1.0,<2.0
+openpyxl>=3.1,<4.0
 # опционально: OCR сканов и картинок; без него такие файлы помечаются как skipped
-indra-ocr>=0.1
+# indra-ocr>=0.1
