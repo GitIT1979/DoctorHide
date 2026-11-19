@@ -47,9 +47,10 @@ MAX_BYTES = 200 * 1024 * 1024
 IMAGE_EXT = D.IMAGE_EXT
 
 PDF_LOCK = threading.Lock()
+ZIP_LOCK = threading.Lock()  # защита от гонок при сборке results.zip
 FILES: list[dict] = []
 LOCK = threading.Lock()
-RUNNING = {"value": False, "started": 0.0, "finished": 0.0}
+RUNNING = {"value": False, "started": 0.0, "finished": 0.0, "stop": False}
 ZIP_CACHE = {"key": None, "path": os.path.join(WORK, "results.zip")}
 
 
@@ -57,9 +58,9 @@ LOG = deque(maxlen=400)
 
 
 def log(msg: str) -> None:
-    # про файлы чужих форматов не пишем: они всё равно не обрабатываются
-    if re.search(r"\.(pdf|doc|jpe?g|png|tiff?|bmp|webp)\b", msg, re.I) and "->" not in msg:
-        return
+    # Фильтр по расширениям убран: он молча прятал ошибки вида
+    # «ошибка чтения документ.pdf». Теперь пишем всё; для /api/log
+    # защита от чтения посторонними — только localhost по умолчанию.
     LOG.append({"t": time.strftime("%H:%M:%S"), "m": msg})
     print(msg, flush=True)
 
@@ -186,6 +187,12 @@ def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
     if ext not in D.SUPPORTED_EXT and ext not in D.IMAGE_EXT:
         raise D.SkipFile(f"формат не поддерживается ({ext or 'без расширения'})")
 
+    # Изображения — через CLI (process._process_image делает OCR + redaction + EXIF + metadata).
+    if ext in D.IMAGE_EXT:
+        if not D.ocr_available():
+            raise D.SkipFile("изображение; для OCR установите indra-ocr: pip install indra-ocr")
+        return _convert_via_cli(src, dst_dir, name, ".pdf", "document", enabled, timeout=300)
+
     if ext == ".pdf":
         try:
             mode = "judicial" if D.is_court_act(_pdf_text(src)) else "document"
@@ -280,16 +287,26 @@ def _restore_queue() -> None:
 
 
 def _build_zip(ready, report: str) -> str:
+    """Собирает zip-архив. Использует ZIP_LOCK + уникальное tmp-имя,
+    чтобы параллельные вызовы не повредили архив."""
     target = ZIP_CACHE["path"]
-    tmp = target + ".tmp"
-    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
-        for _, out in ready:
-            source = os.path.join(OUT_DIR, out)
-            if os.path.exists(source):
-                zf.write(source, arcname=out)
-        zf.writestr("_ОТЧЁТ.txt", report)
-    os.replace(tmp, target)
-    ZIP_CACHE["key"] = tuple(ready)
+    tmp = f"{target}.{uuid.uuid4().hex[:8]}.tmp"
+    with ZIP_LOCK:
+        try:
+            with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED, compresslevel=1) as zf:
+                for _, out in ready:
+                    source = os.path.join(OUT_DIR, out)
+                    if os.path.exists(source):
+                        zf.write(source, arcname=out)
+                zf.writestr("_ОТЧЁТ.txt", report)
+            os.replace(tmp, target)
+            ZIP_CACHE["key"] = tuple(ready)
+        finally:
+            try:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+            except OSError:
+                pass
     return target
 
 
@@ -307,7 +324,13 @@ def _warm_zip() -> None:
 
 
 def _manifest() -> str:
-    """Текст отчёта для архива: ни один файл не пропадает из выдачи молча."""
+    """Текст отчёта для архива.
+
+    ВАЖНО: использует только нейтральные имена (document_NN.ext из item['out'])
+    или id файла, но не исходные имена. Audit-данные (leftover, visible) сюда
+    не пишутся — они идут в _gui_work/audit.log. Это предотвращает утечку ПДн
+    через «обезличенный» архив.
+    """
     lines = ["DoctorHide — отчёт по партии", ""]
     lines.append(f"файлов в очереди: {len(FILES)}")
     done = [f for f in FILES if f["status"] == "done"]
@@ -316,28 +339,48 @@ def _manifest() -> str:
     lines.append(f"не обработано: {len(errors)}")
     lines.append("")
     for f in FILES:
+        # Нейтральное имя: out (document_NN.ext), либо id, но не name (может содержать ПДн).
+        label = f.get("out") or f["id"]
         if f["status"] == "done":
             info = f.get("info") or {}
-            cats = ", ".join(f"{k}:{v}" for k, v in sorted((info.get("leftover") or {}).items()))
-            lines.append(f"[готово] {f['name']} -> {f['out']}")
+            lines.append(f"[готово] {label}")
+            lines.append(f"         режим: {info.get('mode', '—')}, плашек: {info.get('boxes', 0)},"
+                         f" фото закрыто: {info.get('photos', 0)}")
+            # Audit-данные (что осталось незамеченным) — в audit.log, не в пользовательский архив.
             left = info.get("leftover") or {}
             if left:
-                lines.append("         в файле осталось: " + ", ".join(f"{k}:{v}" for k, v in left.items()))
+                try:
+                    from logging.handlers import RotatingFileHandler
+                    import logging as _lg
+                    _audit = _lg.getLogger("doctorhide_audit")
+                    if not _audit.handlers:
+                        import os as _os
+                        _os.makedirs(WORK, exist_ok=True)
+                        _h = RotatingFileHandler(_os.path.join(WORK, "audit.log"),
+                                                maxBytes=1024*1024, backupCount=3, encoding="utf-8")
+                        _h.setFormatter(_lg.Formatter("%(asctime)s %(message)s"))
+                        _audit.addHandler(_h)
+                        _audit.setLevel(_lg.INFO)
+                        _audit.propagate = False
+                    _audit.info(f"файл {label}: осталось неотмеченным — " +
+                                ", ".join(f"{k}:{v}" for k, v in sorted(left.items())))
+                except Exception:
+                    pass
             vis = info.get("visible") or {}
             if vis:
                 for pg, data in vis.items():
-                    lines.append(f"         ВИДНО НА СТРАНИЦЕ {pg}: {data.get('categories')}"
-                                 f" {data.get('names') or ''} {data.get('dates') or ''}")
-            lines.append(f"         режим: {info.get('mode', '—')}, плашек: {info.get('boxes', 0)},"
-                         f" фото закрыто: {info.get('photos', 0)}")
-            if cats:
-                lines.append(f"         ВНИМАНИЕ, найдено в результате: {cats}")
+                    try:
+                        _audit.info(f"файл {label}: страница {pg} — категории: {data.get('categories')}")
+                    except Exception:
+                        pass
         else:
-            lines.append(f"[НЕ ОБРАБОТАН] {f['name']}: {f.get('error') or f['status']}")
+            err = f.get('error') or f['status'] or 'неизвестно'
+            # Не выводим сырой текст ошибки: он может содержать путь к файлу с ПДн.
+            lines.append(f"[НЕ ОБРАБОТАН] {label}: {err}")
     if errors:
         lines.append("")
         lines.append("Файлы с пометкой «НЕ ОБРАБОТАН» в архив не вошли — их надо перезалить"
-                     " или сохранить в поддержанном формате (PDF, DOCX, MD, TXT, PNG/JPEG/TIFF/BMP/WEBP).")
+                     " или сохранить в поддержанном формате (PDF, DOCX, MD, TXT).")
     return "\n".join(lines) + "\n"
 
 
@@ -366,10 +409,19 @@ def _one(item: dict) -> None:
     with LOCK:
         item["status"] = "running"
         item["t0"] = time.time()
+    # Проверяем флаг отмены перед запуском тяжёлой операции.
+    if RUNNING.get("stop"):
+        with LOCK:
+            item["status"] = "queued"
+        return
     try:
         # PDF обрабатываем по одному: PyMuPDF не любит одновременную работу с документами
         if item["path"].lower().endswith(".pdf"):
             with PDF_LOCK:
+                if RUNNING.get("stop"):
+                    with LOCK:
+                        item["status"] = "queued"
+                    return
                 out, info = _convert(item["path"], OUT_DIR, item["name"])
         else:
             out, info = _convert(item["path"], OUT_DIR, item["name"])
@@ -395,6 +447,7 @@ def _one(item: dict) -> None:
 def _worker() -> None:
     """Параллельная обработка: файлы идут пачками по несколько штук сразу."""
     RUNNING["started"] = time.time()
+    RUNNING["stop"] = False
     try:
         with LOCK:
             todo = [f for f in FILES if f["status"] == "queued"]
@@ -406,6 +459,8 @@ def _worker() -> None:
     finally:
         RUNNING["value"] = False
         RUNNING["finished"] = time.time()
+        if not RUNNING.get("stop"):
+            _warm_zip()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -420,6 +475,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(body)
 
@@ -433,8 +489,22 @@ class Handler(BaseHTTPRequestHandler):
         safe = urllib.parse.quote(name)
         self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{safe}")
         self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
         self.wfile.write(data)
+
+    def _origin_ok(self) -> bool:
+        """CSRF: Origin header (если указан) должен совпадать с Host.
+        Same-origin запросы без Origin пропускаются."""
+        origin = self.headers.get("Origin")
+        if not origin:
+            return True
+        host = self.headers.get("Host", "")
+        try:
+            origin_host = urllib.parse.urlparse(origin).netloc
+        except Exception:
+            return False
+        return origin_host == host
 
     # ---------- GET ----------
     def do_GET(self):
@@ -504,20 +574,35 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- POST ----------
     def do_POST(self):
+        # CSRF: блокируем cross-origin POST (если Origin указан и не совпадает с Host).
+        if not self._origin_ok():
+            self._json(403, {"error": "cross-origin request blocked"})
+            return
+
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
         length = int(self.headers.get("Content-Length") or 0)
 
         if path == "/api/add":
+            # Лимит размера тела: MAX_BYTES + 1 МБ запас.
+            if length > MAX_BYTES + 1024 * 1024:
+                self._json(413, {"error": f"файл больше {MAX_BYTES // (1024 * 1024)} МБ"})
+                return
             original = (qs.get("name") or ["file"])[0]
             original = os.path.basename(original.replace("\\", "/"))
+            if len(original) > 255:
+                original = original[-255:]
             name = original
             with LOCK:
                 if len(FILES) >= MAX_FILES:
                     self._json(409, {"error": f"лимит {MAX_FILES} файлов"})
                     return
             data = self.rfile.read(length) if length else b""
+            # Двойная проверка размера (Content-Length мог быть занижен).
+            if len(data) > MAX_BYTES:
+                self._json(413, {"error": f"файл больше {MAX_BYTES // (1024 * 1024)} МБ"})
+                return
             fid = uuid.uuid4().hex[:12]
             dst = os.path.join(IN_DIR, f"{fid}_{name}")
             with open(dst, "wb") as f:
@@ -610,13 +695,30 @@ class Handler(BaseHTTPRequestHandler):
                         f["status"] = "queued"
                         f["error"] = None
                 RUNNING["value"] = True
+                RUNNING["stop"] = False  # сбрасываем флаг отмены перед новым прогоном
+                # Сброс счётчика выходных имён — иначе при повторных прогонах
+                # _claim() добавляет _2, _3 суффиксы из-за остатков в set.
+                D.config.CURRENT["outputs"] = set()
             threading.Thread(target=_worker, daemon=True).start()
             log(f"start: {len(queued)} файлов")
             self._json(200, {"started": len(queued)})
             return
 
-        if path == "/api/clear":
+        if path == "/api/stop":
+            # Останавливает обработку: уже запущенные файлы дообработаются,
+            # но новые из очереди не возьмутся.
             with LOCK:
+                was_running = RUNNING["value"]
+                RUNNING["stop"] = True
+            if was_running:
+                log("остановка по запросу пользователя")
+            self._json(200, {"ok": True, "was_running": was_running})
+            return
+
+        if path == "/api/clear":
+            # Сначала выставляем stop, чтобы рабочий поток не продолжал писать в удаляемые файлы.
+            with LOCK:
+                RUNNING["stop"] = True
                 FILES.clear()
                 RUNNING["value"] = False
                 ZIP_CACHE["key"] = None
@@ -654,8 +756,28 @@ def _already_running(host: str, port: int, timeout: float = 3.0) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description="DoctorHide GUI")
     ap.add_argument("--port", type=int, default=8765)
-    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--host", default="127.0.0.1",
+                    help="Адрес привязки. По умолчанию 127.0.0.1 (только локально). "
+                         "Используйте 0.0.0.0 для удалённого доступа — "
+                         "ВНИМАНИЕ: без аутентификации и TLS.")
+    ap.add_argument("--allow-remote", action="store_true",
+                    help="Подтверждение удалённого режима (требуется при --host 0.0.0.0)")
     args = ap.parse_args()
+
+    # Предупреждение для удалённого режима.
+    if args.host not in ("127.0.0.1", "localhost", "::1"):
+        if not args.allow_remote:
+            print("ВНИМАНИЕ: сервер запрошен в удалённом режиме (--host", args.host, ")",
+                  file=sys.stderr)
+            print("  - Нет аутентификации: любой в сети может загрузить файлы.",
+                  file=sys.stderr)
+            print("  - Нет TLS: имена файлов и журнал идут в открытом виде.",
+                  file=sys.stderr)
+            print("Запуск отменён. Добавьте --allow-remote для подтверждения.",
+                  file=sys.stderr)
+            return 1
+        print("ВНИМАНИЕ: удалённый режим. Без аутентификации и TLS!",
+              file=sys.stderr)
 
     _reset_dirs(wipe=False)
     _restore_queue()
@@ -669,9 +791,9 @@ def main() -> int:
             print(f"Порт {args.port} занят другим процессом — "
                   f"запустите с --port {args.port + 1}", flush=True)
         return 0
-    url = f"http://{args.host}:{args.port}/"
+    url = f"http://127.0.0.1:{args.port}/"  # всегда открываем по localhost
     print(f"DoctorHide GUI: {url}", flush=True)
-    import threading, webbrowser
+    import webbrowser
     threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         httpd.serve_forever()

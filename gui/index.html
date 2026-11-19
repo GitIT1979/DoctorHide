@@ -232,7 +232,14 @@ const list = $('#list'), logBox = $('#log'), bar = $('#bar');
 function stamp(){ return new Date().toTimeString().slice(0,8); }
 function log(msg, kind='info'){
   const line = document.createElement('div');
-  line.innerHTML = `<span class="t">[${stamp()}]</span> <span class="${kind}">${msg}</span>`;
+  const tSpan = document.createElement('span');
+  tSpan.className = 't';
+  tSpan.textContent = '[' + stamp() + ']';
+  const mSpan = document.createElement('span');
+  mSpan.className = kind;
+  mSpan.textContent = ' ' + msg;
+  line.appendChild(tSpan);
+  line.appendChild(mSpan);
   logBox.appendChild(line);
   logBox.scrollTop = logBox.scrollHeight;
 }
@@ -242,7 +249,14 @@ async function pullLog(){
     (d.lines || []).forEach(l => {
       const kind = l.m.startsWith('OK') ? 'ok' : l.m.startsWith('FAIL') ? 'err' : 'info';
       const line = document.createElement('div');
-      line.innerHTML = `<span class="t">[${l.t}]</span> <span class="${kind}">${l.m}</span>`;
+      const tSpan = document.createElement('span');
+      tSpan.className = 't';
+      tSpan.textContent = '[' + l.t + ']';
+      const mSpan = document.createElement('span');
+      mSpan.className = kind;
+      mSpan.textContent = ' ' + l.m;
+      line.appendChild(tSpan);
+      line.appendChild(mSpan);
       logBox.appendChild(line);
     });
     logSince = d.total;
@@ -264,15 +278,50 @@ function row(item){
   }
   const st = item.status || 'queued';
   const label = {queued:'[ ОЖИДАНИЕ ]', running:'[ ОБРАБОТКА ]', done:'[ ГОТОВО ]', error:'[ СБОЙ ]'}[st];
-  const link = st === 'done' ? `<a href="/api/download/${item.id}">СКАЧАТЬ</a>`
-             : st === 'error' ? `<span title="${item.error||''}" style="color:#ff5f5f">?</span>` : '';
-  row.innerHTML = `
-    <div class="ico">${extOf(item.name).slice(0,3).toUpperCase()}</div>
-    <div class="nm" title="${item.name}">${item.name}</div>
-    <div class="sz">${fmtSize(item.size||0)}</div>
-    <div><span class="chip ${st}">${label}</span></div>
-    <div style="text-align:right">${link}</div>
-    <div><button class="del" data-id="${item.id}" title="убрать из очереди">✕</button></div>`;
+  // XSS-safe: createElement + textContent вместо innerHTML.
+  row.textContent = '';
+  const ico = document.createElement('div');
+  ico.className = 'ico';
+  ico.textContent = extOf(item.name).slice(0,3).toUpperCase();
+  row.appendChild(ico);
+  const nm = document.createElement('div');
+  nm.className = 'nm';
+  nm.title = item.name || '';
+  nm.textContent = item.name || '';
+  row.appendChild(nm);
+  const sz = document.createElement('div');
+  sz.className = 'sz';
+  sz.textContent = fmtSize(item.size||0);
+  row.appendChild(sz);
+  const chipCell = document.createElement('div');
+  const chip = document.createElement('span');
+  chip.className = 'chip ' + st;
+  chip.textContent = label;
+  chipCell.appendChild(chip);
+  row.appendChild(chipCell);
+  const linkCell = document.createElement('div');
+  linkCell.style.textAlign = 'right';
+  if (st === 'done') {
+    const a = document.createElement('a');
+    a.href = '/api/download/' + encodeURIComponent(item.id);
+    a.textContent = 'СКАЧАТЬ';
+    linkCell.appendChild(a);
+  } else if (st === 'error') {
+    const span = document.createElement('span');
+    span.title = item.error || '';
+    span.style.color = '#ff5f5f';
+    span.textContent = '?';
+    linkCell.appendChild(span);
+  }
+  row.appendChild(linkCell);
+  const delCell = document.createElement('div');
+  const del = document.createElement('button');
+  del.className = 'del';
+  del.dataset.id = item.id;
+  del.title = 'убрать из очереди';
+  del.textContent = '✕';
+  delCell.appendChild(del);
+  row.appendChild(delCell);
 }
 
 async function upload(file){
@@ -281,7 +330,13 @@ async function upload(file){
     log('пропущен (неподдерживаемый тип): ' + name, 'err');
     return;
   }
-  if (queue.length >= MAX){ log('лимит ' + MAX + ' файлов — «' + file.name + '» пропущен', 'err'); return; }
+  if (queue.length >= MAX){ log('лимит ' + MAX + ' файлов — «' + name + '» пропущен', 'err'); return; }
+  // Проверка размера на клиенте — не нагружаем сервер giant-загрузками.
+  const MAX_BYTES = 200 * 1024 * 1024;
+  if (file.size && file.size > MAX_BYTES) {
+    log('пропущен (больше 200 МБ): ' + name, 'err');
+    return;
+  }
   try{
     const res = await fetch('/api/add?name=' + encodeURIComponent(file.name), { method:'POST', body:file });
     if (!res.ok){ const e = await res.json().catch(()=>({})); throw new Error(e.error||res.status); }
@@ -351,6 +406,11 @@ async function loadUrl(){
     });
     const data = await res.json();
     if (!res.ok) throw new Error(data.error || res.status);
+    // Обрабатываем skipped-ответ сервера: раньше терло name в очередь с undefined.
+    if (data.skipped) {
+      log('пропущен: ' + (data.name || 'файл') + (data.reason ? ' — ' + data.reason : ''), 'err');
+      return;
+    }
     const item = {id:data.id, name:data.name, size:data.size, status:'queued'};
     queue.push(item); row(item); refresh();
     log('+ ' + data.name + ' (' + fmtSize(data.size) + ') по ссылке', 'ok');

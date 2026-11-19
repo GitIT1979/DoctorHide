@@ -191,6 +191,9 @@ def anonymize_docx(path: str, dst: str, mode: str, enabled: set) -> Dict[str, in
             for p in part.paragraphs:
                 _anonymize_paragraph(p, mode, enabled, stats)
     doc.save(dst)
+    # Очистка метаданных: creator, lastModifiedBy, created, modified и т.п.
+    from .metadata import clear_office_metadata
+    clear_office_metadata(dst)
     return stats
 
 
@@ -228,6 +231,9 @@ def anonymize_xlsx(path: str, dst: str, mode: str, enabled: set) -> Dict[str, in
                     for k, v in local.items():
                         stats[k] = stats.get(k, 0) + v
     wb.save(dst)
+    # Очистка метаданных: Application, Company, Manager и т.п.
+    from .metadata import clear_office_metadata
+    clear_office_metadata(dst)
     return stats
 
 

@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -5,8 +6,45 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# DoctorHide: рабочие каталоги GUI и приватные данные
 _gui_work/
 _private/
-*.pdf
-!tests/fixtures/**
+
+# Чувствительные файлы (ПДн, ключи, переменные окружения)
+.env
+.env.*
+*.key
+*.pem
+secrets/
+*.log
+
+# Временные файлы
+*.tmp
+*.bak
+
+# Выходные файлы DoctorHide (результаты обезличивания — не коммитим по умолчанию)
+*_hidden.pdf
+*_hidden.docx
+*_hidden.xlsx
+*_hidden.md
+report.json
+doctorhide.log
+
+# Входные документы с ПДн — раскомментируйте под свою структуру:
+# input/
+# in/
+# uploads/
+# *.pdf
+
+# OS
 .DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+.coverage
+
+# Compiled binaries (use releases, not source tree)
+*.exe

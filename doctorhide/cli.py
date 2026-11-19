@@ -12,7 +12,7 @@ import sys
 from typing import Dict, List, Optional, Sequence
 
 from . import config
-from .config import SkipFile, SUPPORTED_EXT
+from .config import SkipFile, SUPPORTED_EXT, IMAGE_EXT
 from .categories import CATEGORIES
 from .process import process, default_enabled
 
@@ -77,11 +77,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     config.KEEP_FORMAT = args.keep_format
 
     files: List[str] = []
+    # Включаем изображения, если установлен OCR.
+    from .ocr import available as ocr_available
+    accept_ext = set(SUPPORTED_EXT)
+    if ocr_available():
+        accept_ext |= IMAGE_EXT
     for item in args.inputs:
         if os.path.isdir(item):
             for name in sorted(os.listdir(item)):
                 ext = os.path.splitext(name)[1].lower()
-                if ext in SUPPORTED_EXT:
+                if ext in accept_ext:
                     files.append(os.path.join(item, name))
         elif any(ch in item for ch in "*?["):
             files.extend(sorted(glob.glob(item)))
