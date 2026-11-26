@@ -8,7 +8,7 @@
 from __future__ import annotations
 
 import re
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from .text_model import Line, Rect
 
@@ -43,6 +43,8 @@ PATTERNS: List[Tuple[str, str, int]] = [
      r"суд\w*(?:\s+[А-ЯЁа-яё\-]+){0,8}",
      0),
     ("org", r"\bАС\s+[А-ЯЁ][А-Яа-яЁё\-\s]{2,40}", 0),
+    # e-mail, разорванный переносом строки: «ivanov@» / «example.ru»
+    ("contacts", r"[\w.+-]+@\s*\n\s*[\w-]{2,}(?:\.[\w-]{2,})+", 0),
     # ОПФ + имя в кавычках (скрываем только имя)
     ("org", rf"\b(?:{OPF})\s*{NAME_Q}", 1),
     ("org", rf"(?:{OPF_FULL})\s*{NAME_Q}", 1),
@@ -131,36 +133,41 @@ def find_spans(lines: List[Line]) -> List[Tuple[Rect, str]]:
     return hits
 
 
-def replace_spans(text: str, placeholder: str) -> tuple:
-    """Заменяет найденное в тексте. Возвращает (новый текст, число замен)."""
-    lines = []
+def replace_spans(text: str, placeholder: str, enabled: Optional[set] = None) -> tuple:
+    """Заменяет найденное в тексте. Возвращает (новый текст, счётчики по категориям).
+
+    enabled=None — все категории. Счётчики ведутся по категориям, а не одной
+    «org»: в этом проходе есть и e-mail через перенос строки.
+    """
     from .text_model import lines_from_text
     lines = lines_from_text(text)
     if not lines:
-        return text, 0
+        return text, {}
     mp = _Map(lines)
     spans = []
     seen = set()
     for cat, rx, grp in _COMPILED_PATTERNS:
+        if enabled is not None and cat not in enabled:
+            continue
         for m in rx.finditer(mp.text):
             a, b = (m.start(grp), m.end(grp)) if grp else (m.start(), m.end())
             frag = mp.text[a:b].strip(' "')
-            if re.fullmatch(r"(?:ответственност\w*|ограниченн\w*|обществ\w*)", frag, re.I):
+            if _OPF_STOP.fullmatch(frag):
                 continue
             if (a, b) in seen:
                 continue
             seen.add((a, b))
-            spans.append((a, b))
+            spans.append((a, b, cat))
     if not spans:
-        return text, 0
+        return text, {}
     spans.sort()
-    parts, cur, n = [], 0, 0
-    for a, b in spans:
+    parts, cur, stats = [], 0, {}
+    for a, b, cat in spans:
         if a < cur:
             continue
         parts.append(mp.text[cur:a])
         parts.append(placeholder)
         cur = b
-        n += 1
+        stats[cat] = stats.get(cat, 0) + 1
     parts.append(mp.text[cur:])
-    return "".join(parts), n
+    return "".join(parts), stats

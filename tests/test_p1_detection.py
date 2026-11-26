@@ -11,6 +11,7 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 
 from doctorhide import CATEGORIES  # noqa: E402
+from doctorhide.anonymize import anonymize_text  # noqa: E402
 from doctorhide.detect import find_hits  # noqa: E402
 from doctorhide.names import find_names  # noqa: E402
 from doctorhide.text_model import lines_from_text  # noqa: E402
@@ -67,6 +68,23 @@ class HyphenatedNameTests(unittest.TestCase):
     def test_plant_is_not_a_name(self):
         line = lines_from_text("Иван-чай растёт у забора")[0]
         self.assertEqual(find_names(line), [])
+
+
+class EmailAcrossLinesTests(unittest.TestCase):
+    """E-mail, разорванный переносом строки."""
+
+    def test_text_path(self):
+        out, stats = anonymize_text(
+            "e-mail: ivanov@\nexample.ru", "document", set(CATEGORIES)
+        )
+        self.assertNotIn("ivanov@", out)
+        self.assertNotIn("example.ru", out)
+        self.assertEqual(stats.get("contacts"), 1, stats)
+
+    def test_org_kept_when_disabled(self):
+        out, stats = anonymize_text("ООО «Ромашка»", "document", {"person"})
+        self.assertIn("Ромашка", out)
+        self.assertNotIn("org", stats)
 
 
 if __name__ == "__main__":

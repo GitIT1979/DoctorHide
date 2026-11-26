@@ -36,10 +36,9 @@ def anonymize_text(text: str, mode: str, enabled: set):
     stats: Dict[str, int] = {}
     text = normalize(text)
     del mode
-    if "org" in enabled:
-        text, n = replace_spans(text, config.PLACEHOLDER)
-        if n:
-            stats["org"] = stats.get("org", 0) + n
+    text, span_stats = replace_spans(text, config.PLACEHOLDER, enabled)
+    for cat, n in span_stats.items():
+        stats[cat] = stats.get(cat, 0) + n
 
     def sub(cat, rid, rx, val, grp):
         nonlocal text
