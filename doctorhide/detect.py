@@ -11,7 +11,7 @@ from .table_layout import detect_table_blocks, line_table_flags
 from .names import (
     PATRONYMIC, SURNAME_STRICT, _cyr, english_names, find_names, normalize,
 )
-from .rules import RULES, validate
+from .rules import RULES, FIELD_LABEL_RX, validate
 from .text_model import Line, Rect
 from .engine import find_spans
 
@@ -198,6 +198,36 @@ def find_hits(
                         continue
                     for r in nxt.rects_for(m.start(), m.end()):
                         rects.append((r, cat))
+                stats[cat] = stats.get(cat, 0) + 1
+                break
+
+    # Подпись, а значение — текстом на следующей строке: «Место рождения» →
+    # «дер. Верхнее Кукуево». Числовые правила (и пары «подпись → число»)
+    # такой случай не ловят, а в бланках это обычное дело.
+    text_labels = (
+        (r"место\s+рождения", "birth"),
+        (r"кем\s+выдан\w*", "identity"),
+        (r"место\s+(?:жительства|регистрации|пребывания)", "address"),
+        (r"место\s+работы", "employment"),
+    )
+    if only_ids is None:
+        for i, line in enumerate(lines[:-1]):
+            label = line.text.strip().rstrip(":").strip()
+            cat = next((c for pat, c in text_labels
+                        if re.fullmatch(pat, label, re.I)), None)
+            if cat is None or cat not in enabled:
+                continue
+            for nxt in lines[i + 1 : i + 3]:
+                value = nxt.text.strip()
+                if not value:
+                    continue
+                # следующее поле / подпись — значит, значения не было
+                if FIELD_LABEL_RX.match(value):
+                    break
+                if re.match(r"^[А-ЯЁA-Z][^:\n]{0,40}:", value) or len(value) > 120:
+                    break
+                for w in nxt.words:
+                    rects.append((w.rect, cat))
                 stats[cat] = stats.get(cat, 0) + 1
                 break
 
