@@ -271,6 +271,17 @@ class RegressionTests(unittest.TestCase):
         )
 
 
+    def test_filename_masks_latin_surname(self):
+        from doctorhide.process import sanitize_filename
+
+        self.assertEqual(
+            sanitize_filename("Petrov passport", set(CATEGORIES), "document")[0], "passport"
+        )
+        self.assertEqual(
+            sanitize_filename("Ivanova_pasport", set(CATEGORIES), "document")[0], "pasport"
+        )
+
+
 class DateNumberTests(unittest.TestCase):
     """Даты событий не должны рваться при маскировке чисел."""
 

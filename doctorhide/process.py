@@ -70,6 +70,10 @@ def sanitize_filename(stem: str, enabled: set, mode: str):
             continue
         if SURNAME_STRICT.search(low):
             spans.append((m.start(), m.end()))
+    # латиница: Petrov, Ivanova, Smirnov — транслитерация фамилий
+    for m in re.finditer(
+            r"[A-Z][a-z]{2,}(?:ov|ev|in|sky|enko|uk|ich|ova|eva|ina|skaya)(?![A-Za-z])", stem):
+        spans.append((m.start(), m.end()))
     if not spans:
         return stem, False
 

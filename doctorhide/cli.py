@@ -62,7 +62,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                     help="совместимость: имена и так обезличиваются")
     ap.add_argument("--keep-format", action="store_true",
                     help="для DOCX/XLSX: сохранить исходный формат (.docx/.xlsx) с [censored]")
-    ap.add_argument("--keep-meta", action="store_true")
     ap.add_argument("--report", help="записать JSON-отчёт сюда")
     ap.add_argument("--json", action="store_true", help="печатать только JSON")
     args = ap.parse_args(argv)
