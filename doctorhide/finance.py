@@ -15,7 +15,11 @@ from typing import Dict, List, Optional, Tuple
 
 from . import config
 
-NUM_RX = re.compile(r"(?<![\w.,])\d[\d\s\u00a0]*(?:[.,]\d{1,3})?(?![\w])")
+# Число не должно «съедать» хвостовые пробелы: иначе в таблицах
+# `| 1200000 |` превращается в `[censored]|` и ломает разметку.
+NUM_RX = re.compile(
+    r"(?<![\w.,])\d(?:[\d\s\u00a0]*\d)?(?:[.,]\d{1,3})?(?![\w])"
+)
 _SENT_SPLIT = re.compile(r"(?<=[.!?…])\s+|\n+")
 
 # --- якоря «деньги / условные единицы» (B) ---

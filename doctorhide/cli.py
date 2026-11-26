@@ -94,6 +94,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             files.append(item)
     if not files:
         ap.error("не указаны входные файлы")
+    if args.out and len(files) > 1:
+        ap.error(
+            f"-o/--out допустим только для одного входного файла (входов: {len(files)}); "
+            "без -o результаты сохраняются рядом с текущим каталогом"
+        )
 
     results = []
     enabled = None

@@ -9,7 +9,6 @@ from .config import SkipFile
 from .detect import find_hits
 from .ocr import ocr_pdf_pages, ocr_pdf_with_tables, available as ocr_available
 from .text_model import Line, Rect, Word, _group_lines
-from .table_layout import TableBlock
 from .vertical_text import regroup_words_with_vertical
 
 
@@ -174,6 +173,87 @@ def _redact_scan(path: str, dst: str, enabled: set, mode: str, pymupdf) -> Dict[
     return stats
 
 
+def _sanitize_form_fields(page, enabled: set, mode: str, stats: Dict[str, int]) -> None:
+    """Значения полей форм (AcroForm).
+
+    get_text() их не видит, apply_redactions их не трогает — без этого шага
+    «обезличенный» PDF продолжает отдавать ФИО, адрес и телефон из полей.
+    """
+    from .anonymize import anonymize_text
+
+    try:
+        widgets = list(page.widgets() or [])
+    except Exception:  # noqa: BLE001 — битые виджеты не должны ронять файл
+        return
+    for widget in widgets:
+        try:
+            value = widget.field_value
+        except Exception:  # noqa: BLE001
+            continue
+        if not isinstance(value, str) or not value.strip():
+            continue
+        anon, local = anonymize_text(value, mode, enabled)
+        if anon == value:
+            continue
+        try:
+            widget.field_value = anon
+            widget.update()
+        except Exception:  # noqa: BLE001 — поле только для чтения и т.п.
+            continue
+        for cat, n in local.items():
+            stats[cat] = stats.get(cat, 0) + n
+
+
+def _sanitize_annotations(page, enabled: set, mode: str, stats: Dict[str, int]) -> None:
+    """Текст в аннотациях: заметки, комментарии, штампы, всплывающие подсказки."""
+    from .anonymize import anonymize_text
+
+    try:
+        annots = list(page.annots() or [])
+    except Exception:  # noqa: BLE001
+        return
+    for annot in annots:
+        try:
+            info = dict(annot.info or {})
+        except Exception:  # noqa: BLE001
+            continue
+        changed = {}
+        for key in ("content", "title", "subject", "author"):
+            value = info.get(key)
+            if not isinstance(value, str) or not value.strip():
+                continue
+            anon, local = anonymize_text(value, mode, enabled)
+            if anon == value:
+                continue
+            changed[key] = anon
+            for cat, n in local.items():
+                stats[cat] = stats.get(cat, 0) + n
+        if not changed:
+            continue
+        try:
+            # Только изменённые поля: остальные ключи set_info не должен трогать.
+            annot.set_info(changed)
+            annot.update()
+        except Exception:  # noqa: BLE001
+            continue
+
+
+def _drop_attachments(doc) -> int:
+    """Вложенные файлы: на странице не видны, но уходят в копию как есть."""
+    removed = 0
+    try:
+        names = list(doc.embfile_names() or [])
+    except Exception:  # noqa: BLE001
+        return 0
+    for name in names:
+        try:
+            doc.embfile_del(name)
+            removed += 1
+        except Exception:  # noqa: BLE001
+            continue
+    return removed
+
+
 def redact_pdf(path: str, dst: str, enabled: set, mode: str) -> Dict[str, int]:
     """PDF: чёрные полосы. Сканы без текстового слоя — через Indra OCR."""
     pymupdf = _pymupdf()
@@ -185,46 +265,29 @@ def redact_pdf(path: str, dst: str, enabled: set, mode: str) -> Dict[str, int]:
     # Скан — это картинка во всю страницу; короткий текст без картинок — обычный PDF
     # (иначе однострочный текстовый PDF уходил в «скан» и пропускался).
     is_scan = len(full) < 40 and any(p.get_images(full=True) for p in doc)
-    ocr_pages = None
-    ocr_tables = None
-    ocr_rotations = None
     if is_scan:
         doc.close()
         if not ocr_available():
             raise SkipFile("pdf без текстового слоя (установите indra-ocr)")
         return _redact_scan(path, dst, enabled, mode, pymupdf)
     stats: Dict[str, int] = {}
-    for i, page in enumerate(doc):
-        extra = None
-        if is_scan and ocr_pages is not None and i < len(ocr_pages):
-            lines = ocr_pages[i]
-            if ocr_tables and i < len(ocr_tables) and ocr_tables[i]:
-                tb = TableBlock()
-                for ln in lines:
-                    for w in ln.words:
-                        cx = (w.rect.x0 + w.rect.x1) / 2
-                        cy = (w.rect.y0 + w.rect.y1) / 2
-                        if any(r.x0 <= cx <= r.x1 and r.y0 <= cy <= r.y1 for r in ocr_tables[i]):
-                            tb.lines.append(ln)
-                            tb.line_ids.add(id(ln))
-                            break
-                if tb.lines:
-                    tb.money = tb.pii = True
-                    extra = [tb]
-        else:
-            lines = pdf_lines(page)
+    for page in doc:
+        lines = pdf_lines(page)
         hits, page_stats = find_hits(
-            lines, enabled, mode, aggressive_finance=True, extra_tables=extra
+            lines, enabled, mode, aggressive_finance=True
         )
         # pdf_lines отдаёт координаты видимой (повёрнутой) страницы, а плашки
         # ставятся в неповёрнутой системе координат PDF.
-        if not is_scan and page.rotation:
+        if page.rotation:
             hits = [(_transform_rect(r, page.derotation_matrix), cat) for r, cat in hits]
-        if not hits:
-            continue
         for cat, n in page_stats.items():
             stats[cat] = stats.get(cat, 0) + n
-        _apply_bars(page, [r for r, _ in hits], pymupdf, scan=is_scan)
+        # Поля форм и аннотации в текстовом слое не видны — обрабатываем отдельно.
+        _sanitize_form_fields(page, enabled, mode, stats)
+        _sanitize_annotations(page, enabled, mode, stats)
+        if hits:
+            _apply_bars(page, [r for r, _ in hits], pymupdf, scan=False)
+    _drop_attachments(doc)
     doc.set_metadata({})
     # Дополнительно: очистка XMP и Information Dictionary.
     from .metadata import clear_pdf_metadata

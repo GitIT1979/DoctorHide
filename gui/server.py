@@ -53,6 +53,11 @@ LOCK = threading.Lock()
 RUNNING = {"value": False, "started": 0.0, "finished": 0.0, "stop": False}
 ZIP_CACHE = {"key": None, "path": os.path.join(WORK, "results.zip")}
 
+# Заголовок Host должен быть «своим»: иначе DNS-rebinding даёт чужой странице
+# доступ к локальному API и к файлам рабочей папки.
+ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
+HOST_CHECK = {"enabled": True}
+
 
 LOG = deque(maxlen=400)
 
@@ -463,6 +468,25 @@ def _worker() -> None:
             _warm_zip()
 
 
+def _static_file(gui_dir: str, url_path: str):
+    """Файл из каталога gui/ по URL — или None.
+
+    После нормализации путь обязан остаться внутри gui_dir: иначе
+    `GET /../_gui_work/in/<id>_<имя>.png` отдаёт загруженный пользователем скан.
+    """
+    try:
+        rel = urllib.parse.unquote(url_path).lstrip("/")
+        if not rel or rel.startswith("api/"):
+            return None
+        base = os.path.realpath(gui_dir)
+        target = os.path.realpath(os.path.join(base, rel))
+        if os.path.commonpath([base, target]) != base:
+            return None
+    except (ValueError, OSError):
+        return None
+    return target if os.path.isfile(target) else None
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "DoctorHideGUI/1.0"
 
@@ -476,6 +500,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.end_headers()
         self.wfile.write(body)
 
@@ -490,6 +516,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Disposition", f"attachment; filename*=UTF-8''{safe}")
         self.send_header("Content-Length", str(len(data)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
         self.end_headers()
         self.wfile.write(data)
 
@@ -506,8 +534,24 @@ class Handler(BaseHTTPRequestHandler):
             return False
         return origin_host == host
 
+    def _host_ok(self) -> bool:
+        """Host из запроса — наш собственный (защита от DNS-rebinding)."""
+        if not HOST_CHECK["enabled"]:
+            return True
+        raw = (self.headers.get("Host") or "").strip()
+        if not raw:
+            return False
+        try:
+            host = urllib.parse.urlsplit("//" + raw).hostname or ""
+        except ValueError:
+            return False
+        return host.lower() in ALLOWED_HOSTS
+
     # ---------- GET ----------
     def do_GET(self):
+        if not self._host_ok():
+            self._json(403, {"error": "forbidden host"})
+            return
         parsed = urllib.parse.urlparse(self.path)
         path = parsed.path
         qs = urllib.parse.parse_qs(parsed.query)
@@ -518,16 +562,17 @@ class Handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Frame-Options", "DENY")
+            self.send_header("Cross-Origin-Resource-Policy", "same-origin")
             self.end_headers()
             self.wfile.write(data)
             return
 
         # Статические файлы (gif, png, jpg, ico, css, js) из каталога gui/
         if path.startswith("/") and not path.startswith("/api/"):
-            gui_dir = os.path.dirname(os.path.abspath(__file__))
-            static_path = os.path.join(gui_dir, path.lstrip("/"))
-            if os.path.isfile(static_path):
-                ext = os.path.splitext(path)[1].lower()
+            static_path = _static_file(os.path.dirname(os.path.abspath(__file__)), path)
+            if static_path:
+                ext = os.path.splitext(static_path)[1].lower()
                 ct = {".gif": "image/gif", ".png": "image/png", ".jpg": "image/jpeg",
                       ".jpeg": "image/jpeg", ".ico": "image/x-icon",
                       ".css": "text/css", ".js": "application/javascript"}.get(ext)
@@ -537,6 +582,8 @@ class Handler(BaseHTTPRequestHandler):
                     self.send_header("Content-Type", ct)
                     self.send_header("Content-Length", str(len(data)))
                     self.send_header("Cache-Control", "public, max-age=3600")
+                    self.send_header("X-Content-Type-Options", "nosniff")
+                    self.send_header("X-Frame-Options", "DENY")
                     self.end_headers()
                     self.wfile.write(data)
                     return
@@ -593,6 +640,9 @@ class Handler(BaseHTTPRequestHandler):
 
     # ---------- POST ----------
     def do_POST(self):
+        if not self._host_ok():
+            self._json(403, {"error": "forbidden host"})
+            return
         # CSRF: блокируем cross-origin POST (если Origin указан и не совпадает с Host).
         if not self._origin_ok():
             self._json(403, {"error": "cross-origin request blocked"})
@@ -797,6 +847,13 @@ def main() -> int:
             return 1
         print("ВНИМАНИЕ: удалённый режим. Без аутентификации и TLS!",
               file=sys.stderr)
+
+    # Проверка Host: для 0.0.0.0/:: имя в запросе может быть любым,
+    # иначе разрешаем только localhost и явно указанный адрес привязки.
+    if args.host in ("0.0.0.0", "::"):
+        HOST_CHECK["enabled"] = False
+    else:
+        ALLOWED_HOSTS.add(args.host.lower())
 
     _reset_dirs(wipe=False)
     _restore_queue()

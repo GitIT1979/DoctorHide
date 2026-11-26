@@ -326,16 +326,9 @@ def process(path: str, args, enabled: Optional[set] = None):
         raw = sheet_to_md(path)
         if not raw.strip():
             raise SkipFile("в таблице нет данных")
-        rows, heads = [], {}
-        for line in raw.split("\n"):
-            if line.startswith("|") and not re.search(r"\d", line):
-                key = f"HDR{len(heads)}X"
-                heads[key] = line
-                rows.append(key)
-                continue
-            rows.append(line)
-        saved_heads = heads
-        raw = "\n".join(rows)
+        # Шапка и строки таблицы — такие же данные, как и всё остальное:
+        # анонимизируем их наравне с числами. Раньше строки без цифр
+        # подменялись маркером и возвращались в результат без маскировки.
         out_ext = ".md"
     else:
         with open(path, encoding="utf-8") as f:
@@ -350,10 +343,6 @@ def process(path: str, args, enabled: Optional[set] = None):
         _, found = find_hits(lines_from_text(raw), enabled, mode)
         enabled = ask_categories(found)
     anon, stats = anonymize_text(raw, mode, enabled)
-    if ext in SHEET_EXT:
-        for key, original in saved_heads.items():
-            anon = anon.replace(key, original) if key in anon else anon
-            anon = re.sub(r"\[censored\]\s*" + key, original, anon)
     config.CURRENT["enabled"], config.CURRENT["mode"] = enabled, mode
     dst = args.out or out_name(path, out_ext)
     with open(dst, "w", encoding="utf-8") as f:

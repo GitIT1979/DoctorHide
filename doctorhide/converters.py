@@ -210,20 +210,22 @@ def anonymize_xlsx(path: str, dst: str, mode: str, enabled: set) -> Dict[str, in
                 if cell.value is None:
                     continue
                 if not isinstance(cell.value, str):
-                    # числа в ячейках: прогоняем через is_finance только если finance включён
-                    if "finance" in enabled and isinstance(cell.value, (int, float)):
-                        from . import config
-                        from .finance import is_finance_token
-
+                    # Число в ячейке — тоже текст для правил: ИНН, ОГРН, СНИЛС,
+                    # счёт и телефон часто хранят как число. Раньше такие ячейки
+                    # не проверялись вовсе и уходили в результат как есть.
+                    if isinstance(cell.value, bool):
+                        continue
+                    if isinstance(cell.value, (int, float)):
                         val = cell.value
-                        if isinstance(val, float) and val == int(val):
+                        if isinstance(val, float) and val.is_integer():
                             tok = str(int(val))
                         else:
                             tok = str(val)
-                        # без текстового контекста — только длинные / форматированные
-                        if is_finance_token(tok, ""):
-                            cell.value = config.PLACEHOLDER
-                            stats["finance"] = stats.get("finance", 0) + 1
+                        anon, local = anonymize_text(tok, mode, enabled)
+                        if anon != tok:
+                            cell.value = anon
+                            for k, v in local.items():
+                                stats[k] = stats.get(k, 0) + v
                     continue
                 anon, local = anonymize_text(cell.value, mode, enabled)
                 if anon != cell.value:
