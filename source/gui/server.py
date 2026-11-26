@@ -877,16 +877,29 @@ def main() -> int:
 
     _reset_dirs(wipe=False)
     _restore_queue()
+    httpd = None
     try:
         httpd = _Server((args.host, args.port), Handler)
     except OSError:
         if _already_running(args.host, args.port):
-            print(f"Приложение уже запущено: http://{args.host}:{args.port}/ — "
-                  "второй экземпляр не нужен", flush=True)
-        else:
-            print(f"Порт {args.port} занят другим процессом — "
-                  f"запустите с --port {args.port + 1}", flush=True)
-        return 0
+            url = f"http://127.0.0.1:{args.port}/"
+            print(f"Приложение уже запущено: {url}", flush=True)
+            import webbrowser
+            webbrowser.open(url)
+            return 0
+        # Порт занят посторонним процессом: ищем следующий свободный,
+        # иначе двойной клик по exe выглядит как «ничего не произошло».
+        for port in range(args.port + 1, args.port + 11):
+            try:
+                httpd = _Server((args.host, port), Handler)
+                print(f"Порт {args.port} занят, использую {port}", flush=True)
+                args.port = port
+                break
+            except OSError:
+                continue
+        if httpd is None:
+            print(f"Не удалось занять порты {args.port}–{args.port + 10}", flush=True)
+            return 1
     url = f"http://127.0.0.1:{args.port}/"  # всегда открываем по localhost
     print(f"DoctorHide GUI: {url}", flush=True)
     import webbrowser
