@@ -134,6 +134,17 @@ def safe_name(ext: str) -> str:
     return f"document_{n:02d}{ext}"
 
 
+def _visible_files() -> list[dict]:
+    """Файлы очереди для отдачи в /api/status.
+
+    Картинки принимаются на вход и обрабатываются OCR — они тоже должны быть
+    видны в интерфейсе, иначе прогресс не завершится, а строку нельзя удалить.
+    """
+    accepted = D.SUPPORTED_EXT | D.IMAGE_EXT
+    with LOCK:
+        return [dict(f) for f in FILES if f.get("ext") in accepted]
+
+
 def _reset_dirs(wipe: bool = True) -> None:
     """Готовит рабочие папки.
 
@@ -589,9 +600,7 @@ class Handler(BaseHTTPRequestHandler):
                     return
 
         if path == "/api/status":
-            with LOCK:
-                files = [dict(f) for f in FILES
-                         if f.get("ext") in D.SUPPORTED_EXT]
+            files = _visible_files()
             done = sum(1 for f in files if f["status"] in ("done", "error"))
             self._json(200, {
                 "files": [{k: f.get(k) for k in ("id", "name", "status", "out", "error",

@@ -186,6 +186,15 @@ class GuiStaticAndHostTests(unittest.TestCase):
         fake._host_ok = self.mod.Handler._host_ok
         return fake()
 
+    def test_images_visible_in_status(self):
+        self.mod.FILES.append({"id": "test-img", "name": "scan.png",
+                               "ext": ".png", "status": "queued"})
+        try:
+            ids = [f["id"] for f in self.mod._visible_files()]
+            self.assertIn("test-img", ids)
+        finally:
+            self.mod.FILES.clear()
+
     def test_host_check(self):
         self.assertTrue(self._handler("127.0.0.1:8765")._host_ok())
         self.assertTrue(self._handler("localhost:8765")._host_ok())
