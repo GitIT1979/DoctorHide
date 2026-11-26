@@ -87,5 +87,21 @@ class EmailAcrossLinesTests(unittest.TestCase):
         self.assertNotIn("org", stats)
 
 
+class LoneSurnameTests(unittest.TestCase):
+    """Фамилия отдельным словом — значение поля в бланке."""
+
+    def test_single_word_line(self):
+        line = lines_from_text("Волкова")[0]
+        self.assertEqual([line.text[a:b] for a, b in find_names(line)], ["Волкова"])
+
+    def test_surname_in_sentence_untouched(self):
+        line = lines_from_text("Иванова подпись стоит внизу")[0]
+        self.assertEqual(find_names(line), [])
+
+    def test_ordinary_word_untouched(self):
+        line = lines_from_text("Приложение")[0]
+        self.assertEqual(find_names(line), [])
+
+
 if __name__ == "__main__":
     unittest.main()

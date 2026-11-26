@@ -266,6 +266,16 @@ def find_names(line: Line) -> List[Tuple[int, int]]:
                 end = toks[i + 1][1]
             spans.append((toks[i - 1][0], end))
 
+    # Фамилия отдельным словом на своей строке — значение поля в бланке
+    # («Волкова», «Кузнецова»). В предложении такую фамилию по-прежнему
+    # не трогаем: там она чаще оказывается обычным словом.
+    if n == 1:
+        token = _cyr(toks[0][2]).strip(".,;:()«»\"'")
+        low1 = token.lower()
+        if (len(token) >= 4 and re.fullmatch(r"[А-ЯЁ][А-Яа-яЁё\-]+", token)
+                and low1 not in NAME_STOP and SURNAME_STRICT.search(low1)):
+            spans.append((toks[0][0], toks[0][1]))
+
     merged: List[Tuple[int, int]] = []
     for a, b in sorted(spans):
         if merged and a <= merged[-1][1]:
