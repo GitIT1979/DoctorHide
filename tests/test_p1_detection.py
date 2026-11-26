@@ -12,6 +12,7 @@ sys.path.insert(0, ROOT)
 
 from doctorhide import CATEGORIES  # noqa: E402
 from doctorhide.detect import find_hits  # noqa: E402
+from doctorhide.names import find_names  # noqa: E402
 from doctorhide.text_model import lines_from_text  # noqa: E402
 
 
@@ -41,14 +42,31 @@ class LabelTextValueTests(unittest.TestCase):
             "ОВД Тверского района\n",
             aggressive_finance=True,
         )
-        # «Кем выдан» — не значение места рождения; его значение закрывается
-        # отдельным правилом по той же строке/следующей.
+        # «Кем выдан» — не значение места рождения.
         self.assertNotIn("birth", stats)
 
     def test_long_paragraph_is_not_treated_as_value(self):
         big = " ".join(["текст"] * 40)
         rects, stats = hits("Место рождения\n" + big + "\n", aggressive_finance=True)
         self.assertNotIn("birth", stats)
+
+
+class HyphenatedNameTests(unittest.TestCase):
+    """Составные имена и фамилии."""
+
+    def test_double_first_name(self):
+        line = lines_from_text("Также Мария-Луиза Казарян")[0]
+        spans = [line.text[a:b] for a, b in find_names(line)]
+        self.assertIn("Мария-Луиза Казарян", spans)
+
+    def test_hyphenated_surname_untouched(self):
+        line = lines_from_text("Сергеев-Кузнецов Дмитрий Олегович прибыл")[0]
+        spans = [line.text[a:b] for a, b in find_names(line)]
+        self.assertIn("Сергеев-Кузнецов Дмитрий Олегович", spans)
+
+    def test_plant_is_not_a_name(self):
+        line = lines_from_text("Иван-чай растёт у забора")[0]
+        self.assertEqual(find_names(line), [])
 
 
 if __name__ == "__main__":

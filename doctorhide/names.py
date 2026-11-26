@@ -222,6 +222,15 @@ def find_names(line: Line) -> List[Tuple[int, int]]:
                 and SURNAME_STRICT.search(low.split("-")[0])):
             spans.append((a, b))
             continue
+        # составное имя: «Мария-Луиза Казарян» — первая половина из справочника,
+        # вторая — кириллическое слово в нижнем регистре
+        if "-" in low and i + 1 < n:
+            parts = [p for p in re.split(r"[-–]", low) if p]
+            if (len(parts) == 2 and parts[0] in GIVEN_NAMES
+                    and re.fullmatch(r"[а-яё]{2,}", parts[1])
+                    and as_name(toks[i + 1][2])):
+                spans.append((a, toks[i + 1][1]))
+                continue
         if PATRONYMIC.search(low) and name_tok(t):
             j = i
             while j > 0 and i - j < 2 and name_tok(toks[j - 1][2]):
