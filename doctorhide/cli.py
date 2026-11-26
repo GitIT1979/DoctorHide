@@ -148,4 +148,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         print(json.dumps(results, ensure_ascii=False, indent=2))
 
     failed = sum(1 for r in results if r.get("status") in ("error", "skipped"))
-    return 1 if failed and not any(r.get("status") == "ok" for r in results) else 0
+    # Любой пропуск/ошибка — ненулевой код: иначе скрипт считает пачку
+    # успешной, хотя часть файлов не обработана.
+    return 1 if failed else 0

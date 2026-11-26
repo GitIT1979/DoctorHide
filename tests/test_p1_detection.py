@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -178,6 +179,29 @@ class PhotoClosingTests(unittest.TestCase):
         redact_pdf(src, dst, set(CATEGORIES), "document")
         # без маркеров бланка портрет не трогаем
         self.assertGreater(self._crop_extrema(dst, (80, 110, 180, 250))[1], 150)
+
+
+class CliExitCodeTests(unittest.TestCase):
+    """Частичный успех не должен давать код 0."""
+
+    def test_partial_batch_exits_nonzero(self):
+        import shutil
+
+        tmp = tempfile.mkdtemp()
+        try:
+            good = os.path.join(tmp, "good.md")
+            bad = os.path.join(tmp, "bad.xyz")
+            with open(good, "w", encoding="utf-8") as fh:
+                fh.write("Иванов Иван Иванович\n")
+            with open(bad, "w", encoding="utf-8") as fh:
+                fh.write("x")
+            proc = subprocess.run(
+                [sys.executable, os.path.join(ROOT, "doctorhide.py"), good, bad],
+                capture_output=True, text=True, encoding="utf-8", errors="replace",
+            )
+            self.assertNotEqual(proc.returncode, 0)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
 
 if __name__ == "__main__":
