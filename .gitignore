@@ -48,3 +48,8 @@ Thumbs.db
 
 # Compiled binaries (use releases, not source tree)
 *.exe
+
+# Сборка PyInstaller
+build/
+dist/
+*.spec

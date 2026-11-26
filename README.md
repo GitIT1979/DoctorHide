@@ -49,6 +49,18 @@ python -m pip install -r requirements.txt
 PATH не обязателен, берётся и `C:\Program Files\LibreOffice\program\soffice.exe`.
 Для PDF — пакет `pymupdf`.
 
+## Готовая сборка
+
+`DoctorHide.exe` собран PyInstaller и не требует Python:
+
+- без аргументов — GUI: локальный сервер и браузер;
+- с аргументами — CLI: `DoctorHide.exe "документ.pdf" --keep org`;
+- рабочая папка `_gui_work` создаётся рядом с exe.
+
+В сборку **не включён OCR** (`indra-ocr`): сканы и изображения в ней пропускаются
+с понятной причиной. Для `.doc/.rtf/.xls` нужен установленный LibreOffice.
+Пересобрать: `build_exe.bat` (нужен Python с `pip install pyinstaller`).
+
 ## Использование
 
 ```bash
@@ -124,6 +136,8 @@ python doctorhide.py in/ --report report.json --json
 
 ```
 doctorhide.py               точка входа CLI
+launcher.py                 точка входа сборки (GUI/CLI)
+build_exe.bat               сборка DoctorHide.exe (PyInstaller)
 doctorhide/                 пакет: правила, детекция, PDF, конвертеры, OCR
 gui/server.py               локальный сервер интерфейса
 tests/                      юнит-тесты и сквозная самопроверка

@@ -38,7 +38,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 import doctorhide as D  # noqa: E402
 
-WORK = os.path.join(ROOT, "_gui_work")
+FROZEN = bool(getattr(sys, "frozen", False))
+# В сборке ROOT — временная папка распаковки: очередь и результаты кладём рядом с exe,
+# иначе они исчезают после закрытия программы.
+WORK = (os.path.join(os.path.dirname(os.path.abspath(sys.executable)), "_gui_work")
+        if FROZEN else os.path.join(ROOT, "_gui_work"))
 IN_DIR = os.path.join(WORK, "in")
 OUT_DIR = os.path.join(WORK, "out")
 MAX_FILES = 100
@@ -176,11 +180,18 @@ def _pdf_text(src: str) -> str:
     return text
 
 
+def _cli_prefix() -> list[str]:
+    """Чем запускать CLI: скриптом или (в сборке) тем же exe с --cli."""
+    if FROZEN:
+        return [sys.executable, "--cli"]
+    return [sys.executable, os.path.join(ROOT, "doctorhide.py")]
+
+
 def _convert_via_cli(src: str, dst_dir: str, name: str, out_ext: str, mode: str,
                      enabled: set, timeout: int = 180) -> tuple[str, dict]:
     """Обработка через CLI: для форматов, где нужен LibreOffice (.doc/.rtf)."""
     dst = _unique(os.path.join(dst_dir, D.output_name(name, out_ext, enabled, mode)))
-    cmd = [sys.executable, os.path.join(ROOT, "doctorhide.py"), src, "-o", dst, "--keep-name"]
+    cmd = _cli_prefix() + [src, "-o", dst, "--keep-name"]
     try:
         proc = subprocess.run(cmd, capture_output=True, timeout=timeout, check=False, text=True)
     except subprocess.TimeoutExpired:
@@ -215,7 +226,7 @@ def _convert(src: str, dst_dir: str, name: str) -> tuple[str, dict]:
         except Exception as err:  # noqa: BLE001 — битый файл или не PDF
             raise D.SkipFile(f"не удалось открыть PDF: {type(err).__name__}") from err
         dst = _unique(os.path.join(dst_dir, D.output_name(name, ".pdf", enabled, mode)))
-        cmd = [sys.executable, os.path.join(ROOT, "doctorhide.py"), src, "-o", dst,
+        cmd = _cli_prefix() + [src, "-o", dst,
                "--keep-name", "--json"]
         try:
             proc = subprocess.run(cmd, capture_output=True, timeout=900, check=False, text=True)
