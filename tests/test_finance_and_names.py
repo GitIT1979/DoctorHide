@@ -271,5 +271,23 @@ class RegressionTests(unittest.TestCase):
         )
 
 
+class DateNumberTests(unittest.TestCase):
+    """Даты событий не должны рваться при маскировке чисел."""
+
+    def test_date_after_money_stays(self):
+        anon, _ = anonymize_text("Оплата 15 000 рублей до 31.12.2026",
+                                 "document", set(CATEGORIES))
+        self.assertIn("31.12.2026", anon)
+        self.assertNotIn("15 000", anon)
+
+    def test_date_without_money_stays(self):
+        anon, _ = anonymize_text("Срок 01.07.25 по договору", "document", set(CATEGORIES))
+        self.assertIn("01.07.25", anon)
+
+    def test_decimal_money_still_masked(self):
+        anon, _ = anonymize_text("Сумма 1234.56 руб.", "document", set(CATEGORIES))
+        self.assertNotIn("1234.56", anon)
+
+
 if __name__ == "__main__":
     unittest.main()
