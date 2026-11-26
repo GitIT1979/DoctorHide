@@ -105,6 +105,17 @@ class LoneSurnameTests(unittest.TestCase):
         self.assertEqual(find_names(line), [])
 
 
+class QuotesTests(unittest.TestCase):
+    """Анонимизация организаций не должна портить типографику."""
+
+    def test_quotes_preserved(self):
+        out, stats = anonymize_text("ООО «Ромашка» и «Союз»", "document", set(CATEGORIES))
+        self.assertIn("«", out)
+        self.assertIn("»", out)
+        self.assertNotIn("Ромашка", out)
+        self.assertIn("«Союз»", out)
+
+
 class PhotoClosingTests(unittest.TestCase):
     """Портрет в бланке закрывается, широкая графика — нет."""
 

@@ -80,22 +80,28 @@ class _Map:
     def __init__(self, lines: List[Line]):
         self.lines = lines
         parts: List[str] = []
+        # исходный текст (без нормализации кавычек) — для сборки результата
+        source: List[str] = []
         # (start_in_joined, line_idx, word_idx)
         self.words: List[Tuple[int, int, int]] = []
         pos = 0
         for li, ln in enumerate(lines):
             if parts:
                 parts.append("\n")
+                source.append("\n")
                 pos += 1
             line_norm = _norm(ln.text)
             # пересчитать starts по нормализованной строке той же длины
             # кавычки 1:1, длина не меняется
             base = pos
             parts.append(line_norm)
+            source.append(ln.text)
             for wi, (w, st) in enumerate(zip(ln.words, ln.starts)):
                 self.words.append((base + st, li, wi))
             pos += len(line_norm)
         self.text = "".join(parts)
+        # длина совпадает с self.text посимвольно — можно резать по тем же индексам
+        self.source = "".join(source)
 
     def rects_for(self, a: int, b: int) -> List[Rect]:
         out: List[Rect] = []
@@ -165,9 +171,9 @@ def replace_spans(text: str, placeholder: str, enabled: Optional[set] = None) ->
     for a, b, cat in spans:
         if a < cur:
             continue
-        parts.append(mp.text[cur:a])
+        parts.append(mp.source[cur:a])
         parts.append(placeholder)
         cur = b
         stats[cat] = stats.get(cat, 0) + 1
-    parts.append(mp.text[cur:])
+    parts.append(mp.source[cur:])
     return "".join(parts), stats
