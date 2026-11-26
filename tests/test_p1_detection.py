@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import sys
+import tempfile
 import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,6 +15,7 @@ from doctorhide import CATEGORIES  # noqa: E402
 from doctorhide.anonymize import anonymize_text  # noqa: E402
 from doctorhide.detect import find_hits  # noqa: E402
 from doctorhide.names import find_names  # noqa: E402
+from doctorhide.pdf import redact_pdf  # noqa: E402
 from doctorhide.text_model import lines_from_text  # noqa: E402
 
 
@@ -101,6 +103,57 @@ class LoneSurnameTests(unittest.TestCase):
     def test_ordinary_word_untouched(self):
         line = lines_from_text("Приложение")[0]
         self.assertEqual(find_names(line), [])
+
+
+class PhotoClosingTests(unittest.TestCase):
+    """Портрет в бланке закрывается, широкая графика — нет."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _page_with(self, img_size, text):
+        import pymupdf
+        from PIL import Image
+
+        photo = os.path.join(self.tmp, "img.png")
+        Image.new("RGB", img_size, (198, 176, 150)).save(photo)
+        doc = pymupdf.open()
+        page = doc.new_page(width=595, height=842)
+        page.insert_font(fontname="F0", fontfile=r"C:\Windows\Fonts\arial.ttf")
+        page.insert_text((60, 60), text, fontname="F0", fontsize=12)
+        page.insert_image(pymupdf.Rect(60, 90, 200, 270), filename=photo)
+        src = os.path.join(self.tmp, "src.pdf")
+        doc.save(src)
+        doc.close()
+        return src
+
+    def _crop_extrema(self, pdf, box):
+        import pymupdf
+        from PIL import Image
+
+        doc = pymupdf.open(pdf)
+        pix = doc[0].get_pixmap(dpi=72, colorspace=pymupdf.csGRAY, alpha=False)
+        im = Image.frombytes("L", (pix.width, pix.height), pix.samples)
+        doc.close()
+        return im.crop(box).getextrema()
+
+    def test_portrait_closed_on_id_page(self):
+        src = self._page_with((300, 400), "СВИДЕТЕЛЬСТВО О РОЖДЕНИИ")
+        dst = os.path.join(self.tmp, "out.pdf")
+        redact_pdf(src, dst, set(CATEGORIES), "document")
+        self.assertLess(self._crop_extrema(dst, (80, 110, 180, 250))[1], 45)
+
+    def test_plain_page_photo_kept(self):
+        src = self._page_with((300, 400), "Отчёт о работе отдела")
+        dst = os.path.join(self.tmp, "out2.pdf")
+        redact_pdf(src, dst, set(CATEGORIES), "document")
+        # без маркеров бланка портрет не трогаем
+        self.assertGreater(self._crop_extrema(dst, (80, 110, 180, 250))[1], 150)
 
 
 if __name__ == "__main__":

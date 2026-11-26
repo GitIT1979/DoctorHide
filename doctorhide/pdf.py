@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from typing import Dict, List, Tuple
 
 from .config import SkipFile
@@ -153,6 +154,18 @@ def _redact_scan(path: str, dst: str, enabled: set, mode: str, pymupdf) -> Dict[
         hits, page_stats = find_hits(lines, enabled, mode, aggressive_finance=True)
         for cat, n in page_stats.items():
             stats[cat] = stats.get(cat, 0) + n
+        # Портрет на бланке — часть ПДн, которая не читается как текст.
+        if "person" in enabled and _looks_like_id_doc(lines):
+            photos = _photo_blobs(upright)
+            for pr in photos:
+                cv2.rectangle(
+                    upright,
+                    (max(0, int(pr.x0)), max(0, int(pr.y0))),
+                    (min(w - 1, int(pr.x1)), min(h - 1, int(pr.y1))),
+                    0, -1,
+                )
+            if photos:
+                stats["person"] = stats.get("person", 0) + len(photos)
         for b in bars([r for r, _ in hits]):
             cv2.rectangle(
                 upright,
@@ -238,6 +251,111 @@ def _sanitize_annotations(page, enabled: set, mode: str, stats: Dict[str, int]) 
             continue
 
 
+# Маркеры бланка личности: только на таких страницах ищем портрет.
+_ID_MARKERS = re.compile(
+    r"(?:паспорт\w*|свидетельств\w*\s+о\s+\w+|кем\s+выдан\w*|дата\s+рождения|"
+    r"место\s+рождения|водительск\w+\s+удостоверен\w*|полис\w*\s+ОМС|"
+    r"СНИЛС|военн\w+\s+билет\w*)",
+    re.I,
+)
+
+
+def _looks_like_id_doc(lines: List[Line]) -> bool:
+    """Страница похожа на бланк личности — только там закрываем портрет."""
+    text = "\n".join(ln.text for ln in lines)
+    return bool(text.strip()) and bool(_ID_MARKERS.search(text))
+
+
+def _photo_rects(page, pymupdf) -> List[Rect]:
+    """Портретные изображения на странице (фото в бланке).
+
+    Логотипы и графики обычно шире или меньше; отбираем вертикальные
+    картинки разумного размера, не занимающие большую часть страницы.
+    """
+    out: List[Rect] = []
+    try:
+        images = page.get_images(full=True)
+    except Exception:  # noqa: BLE001
+        return out
+    page_area = abs(page.rect) or 1.0
+    seen = set()
+    for info in images:
+        if not info:
+            continue
+        xref = info[0]
+        try:
+            rects = page.get_image_rects(xref)
+        except Exception:  # noqa: BLE001
+            continue
+        for r in rects:
+            w, h = r.width, r.height
+            if w < 70 or h < 90 or not h:
+                continue
+            if not (0.55 <= w / h <= 0.95):
+                continue
+            if w * h > page_area * 0.45:
+                continue
+            key = (round(r.x0), round(r.y0), round(r.x1), round(r.y1))
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append(Rect(r.x0, r.y0, r.x1, r.y1))
+    return out
+
+
+def _photo_blobs(gray) -> List[Rect]:
+    """Фото на скане: компактное пятно средних тонов (не текст и не бумага).
+
+    Работает по серому растру: у текста и бумаги средний тон ячейки почти
+    белый или чёрный, у фотографии — серый.
+    """
+    try:
+        import numpy as np
+    except ImportError:
+        return []
+    h, w = gray.shape[:2]
+    if w < 120 or h < 120:
+        return []
+    cell = max(8, int(min(w, h) / 90))
+    gw, gh = w // cell, h // cell
+    if gw < 6 or gh < 6:
+        return []
+    small = gray[: gh * cell, : gw * cell].reshape(gh, cell, gw, cell).mean(axis=(1, 3))
+    hot = (small >= 70) & (small <= 208)
+    seen = np.zeros_like(hot, dtype=bool)
+    page_area = float(w * h)
+    out: List[Rect] = []
+    for gy in range(gh):
+        for gx in range(gw):
+            if not hot[gy, gx] or seen[gy, gx]:
+                continue
+            stack = [(gx, gy)]
+            seen[gy, gx] = True
+            cells = []
+            while stack:
+                x, y = stack.pop()
+                cells.append((x, y))
+                for nx, ny in ((x - 1, y), (x + 1, y), (x, y - 1), (x, y + 1)):
+                    if 0 <= nx < gw and 0 <= ny < gh and hot[ny, nx] and not seen[ny, nx]:
+                        seen[ny, nx] = True
+                        stack.append((nx, ny))
+            if not cells:
+                continue
+            xs = [c[0] for c in cells]
+            ys = [c[1] for c in cells]
+            x0, x1 = min(xs), max(xs) + 1
+            y0, y1 = min(ys), max(ys) + 1
+            bw, bh = (x1 - x0) * cell, (y1 - y0) * cell
+            area_frac = (bw * bh) / page_area
+            fill = len(cells) / max(1, (x1 - x0) * (y1 - y0))
+            if not (0.004 <= area_frac <= 0.30) or fill < 0.55:
+                continue
+            if bh < 100 or bw < 70 or not (0.55 <= bw / bh <= 0.95):
+                continue
+            out.append(Rect(x0 * cell, y0 * cell, x1 * cell, y1 * cell))
+    return out
+
+
 def _drop_attachments(doc) -> int:
     """Вложенные файлы: на странице не видны, но уходят в копию как есть."""
     removed = 0
@@ -280,6 +398,12 @@ def redact_pdf(path: str, dst: str, enabled: set, mode: str) -> Dict[str, int]:
         # ставятся в неповёрнутой системе координат PDF.
         if page.rotation:
             hits = [(_transform_rect(r, page.derotation_matrix), cat) for r, cat in hits]
+        # Портрет в бланке: картинка не текст, точечные правила её не видят.
+        if "person" in enabled and _looks_like_id_doc(lines):
+            photos = _photo_rects(page, pymupdf)
+            if photos:
+                hits = list(hits) + [(r, "person") for r in photos]
+                stats["person"] = stats.get("person", 0) + len(photos)
         for cat, n in page_stats.items():
             stats[cat] = stats.get(cat, 0) + n
         # Поля форм и аннотации в текстовом слое не видны — обрабатываем отдельно.
