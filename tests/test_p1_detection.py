@@ -116,6 +116,19 @@ class QuotesTests(unittest.TestCase):
         self.assertIn("«Союз»", out)
 
 
+class AgeTests(unittest.TestCase):
+    """«N лет» — возраст только при явном контексте."""
+
+    def test_contract_term_not_age(self):
+        anon, _ = anonymize_text("Срок договора 3 года с момента подписания",
+                                 "document", set(CATEGORIES))
+        self.assertIn("3 года", anon)
+
+    def test_age_after_name_masked(self):
+        anon, _ = anonymize_text("Петров Пётр, 45 лет, проживает", "document", set(CATEGORIES))
+        self.assertNotIn("45 лет", anon)
+
+
 class PhotoClosingTests(unittest.TestCase):
     """Портрет в бланке закрывается, широкая графика — нет."""
 
